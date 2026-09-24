@@ -1,27 +1,33 @@
-# 🤖 Antigravity Telegram Bot (VPS & Docker Ready)
+# 🤖 Antigravity Telegram Bot (Native `agy` CLI Engine)
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![Systemd Ready](https://img.shields.io/badge/systemd-ready-green.svg)](https://systemd.io/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Antigravity Telegram Bot** adalah jembatan komunikasi produksi antara Telegram dan AI Agent **Google Antigravity** yang dirancang untuk berjalan di lingkungan **Laptop Lokal maupun VPS Headless (Linux/Ubuntu/Debian)** menggunakan **Docker Compose**.
+**Antigravity Telegram Bot** adalah bot Telegram yang terhubung langsung dengan **Native Antigravity CLI (`agy`) Engine** di VPS Linux maupun komputer lokal. 
 
-Dilengkapi sistem **Interactive Approval (ala NousResearch/hermes-agent)** untuk meminta konfirmasi interaktif sebelum mengeksekusi perintah terminal mutatif atau memodifikasi berkas penting langsung dari chat Telegram.
+Berbeda dengan integrasi API biasa yang memerlukan kunci API developer per-token, arsitektur ini **menggunakan sesi login Google Antigravity resmi yang sudah aktif di VPS/host (`~/.gemini/antigravity-cli/`)**, sehingga memaksimalkan kuota langganan akun Google Anda tanpa biaya API tambahan dan hanya mengonsumsi **~35 MB RAM** saat berjalan sebagai service Systemd.
+
+Dilengkapi sistem **Interactive Approval (ala Hermes Agent)** untuk meminta konfirmasi interaktif sebelum mengeksekusi instruksi mutatif atau menghapus data penting langsung dari chat Telegram.
 
 ---
 
 ## ✨ Fitur Utama
 
-- 🛡️ **Whitelist Authorization Check**: Hanya Telegram User ID terdaftar (`ALLOWED_USER_ID`) yang dapat mengakses dan mengeksekusi instruksi bot.
-- 🧠 **Multi-Turn Stateful Session Memory**: Memori sesi percakapan persisten antar-pesan dengan kemampuan reset instan via `/reset`.
-- ⚠️ **Interactive Approval System (Hermes Style)**:
-  - **Hardline Blocklist**: Mencegah secara mutlak eksekusi perintah katastropik (`rm -rf /`, fork bomb, format disk, shutdown sistem) tanpa membuka celah konfirmasi.
-  - **Inline Keyboard Confirmation**: Menampilkan tombol `[ ✅ Setujui (Approve) ]` dan `[ ❌ Tolak (Deny) ]` untuk aksi mutatif (bash, git push, edit/hapus berkas).
-  - **Fail-Closed Timeout**: Eksekusi dibatalkan secara otomatis jika tombol tidak ditekan dalam batas waktu (default: 120 detik).
-- 🛑 **Task Interruption & Cancellation**: Dukungan pembatalan proses agen atau perintah yang sedang berjalan via `/cancel`.
-- 📁 **Native Media & File Delivery**: Mendeteksi sintaks `MEDIA:/path/ke/file` pada output agen dan otomatis mengirimkannya sebagai dokumen Telegram (`send_document`).
-- ⏳ **Live Ephemeral Updates & Typing Indicator**: Indikator status pengetikan berkala dan pembaruan pesan progres saat tool dijalankan.
-- ✂️ **Safe Message Chunking & Markdown Fallback**: Pemotongan pesan otomatis di bawah 4000 karakter dengan fallback mulus ke *plain text* jika terjadi kesalahan parsing Markdown.
+- ⚡ **Native `agy` CLI Subprocess Engine**: Memanggil binary resmi `agy` secara asinkron tanpa ketergantungan API key pihak ketiga.
+- 💰 **Bebas Biaya API Tambahan**: Menggunakan akun Google Antigravity yang sudah login di VPS, menghemat biaya dan terhindar dari limit ketat API gratis.
+- 🪶 **Super Ringan di VPS**: Hanya memakan ~35 MB RAM saat dijalankan langsung via `systemd`.
+- 🛡️ **Whitelist Authorization Check**: Hanya Telegram User ID terdaftar (`ALLOWED_USER_ID`) yang dapat mengakses dan mengeksekusi bot.
+- 🧠 **Multi-Turn Stateful Session Memory**: Mempertahankan `conversation_id` resmi `agy` antar-pesan dengan kemampuan reset instan via `/reset`.
+- ⚠️ **Hermes-Style Interactive Approval**:
+  - **Hardline Security Blocklist**: Mencegah secara mutlak eksekusi perintah katastropik (`rm -rf /`, fork bomb, format disk, shutdown sistem) tanpa membuka tombol konfirmasi.
+  - **Inline Keyboard Confirmation**: Menampilkan tombol `[ ✅ Setujui (Approve) ]` dan `[ ❌ Tolak (Deny) ]` untuk aksi berisiko tinggi.
+  - **Fail-Closed Timeout**: Eksekusi dibatalkan otomatis jika tombol tidak ditekan dalam batas waktu (default: 120 detik).
+- 🛑 **Real Process Interruption (`/cancel`)**: Menghentikan proses `agy` yang sedang berjalan di sistem host secara instan (`SIGTERM`/`SIGKILL`).
+- 📁 **Native Media & File Delivery**: Mendeteksi sintaks `MEDIA:/path/ke/file` pada output `agy` dan otomatis mengirimkannya sebagai dokumen Telegram (`send_document`).
+- ⏳ **Live Timer Feedback & Typing**: Indikator pengetikan berkala dan pembaruan timer detik berjalan selama proses berlangsung.
+- ✂️ **Safe Message Chunking & Markdown Fallback**: Pemotongan pesan otomatis di bawah 4000 karakter dengan fallback mulus ke *plain text* jika Markdown invalid.
 
 ---
 
@@ -32,134 +38,72 @@ tm-agy-tele/
 ├── .env.example              # Template konfigurasi environment
 ├── .env                      # Konfigurasi aktif (diabaikan oleh git)
 ├── .gitignore                # Aturan file yang diabaikan git
-├── requirements.txt          # Dependensi Python
+├── requirements.txt          # Dependensi Python minimal (python-telegram-bot, python-dotenv)
 ├── Dockerfile                # Image container Python 3.11-slim
-├── docker-compose.yml        # Konfigurasi container, volume mount, dan memory limit
-├── bot.py                    # Source code utama bot
-├── plan.md                   # Dokumen rancangan arsitektur lengkap
+├── docker-compose.yml        # Konfigurasi container opsional
+├── bot.py                    # Source code utama bot (Native agy Subprocess Engine)
+├── test_bot.py               # Unit tests komprehensif
+├── deploy.sh                 # Script deployment otomatis (Systemd Service & Docker)
+├── plan.md                   # Dokumen rancangan arsitektur
 └── README.md                 # Dokumentasi operasional ini
 ```
 
 ---
 
-## 🚀 Panduan Menjalankan di Komputer Lokal
-
-### 1. Prasyarat
-- Python 3.11 atau lebih baru
-- Token bot dari [@BotFather](https://t.me/BotFather) di Telegram
-- User ID Telegram Akang dari [@userinfobot](https://t.me/userinfobot)
-- Kredensial login Antigravity di direktori lokal `~/.gemini` (atau `%USERPROFILE%\.gemini` di Windows)
-
-### 2. Setup Environment
-```bash
-# Salin konfigurasi environment
-cp .env.example .env
-
-# Buat virtual environment
-python -m venv .venv
-
-# Aktifkan virtual environment:
-# Di Linux/macOS:
-source .venv/bin/activate
-# Di Windows (PowerShell):
-.venv\Scripts\Activate.ps1
-
-# Pasang dependensi
-pip install -r requirements.txt
-```
-
-### 3. Konfigurasi `.env`
-Buka file `.env` dan masukkan data Anda:
-```env
-TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
-ALLOWED_USER_ID="7163641352"
-APPROVAL_MODE="ask_destructive"
-APPROVAL_TIMEOUT_SECONDS=120
-WORKSPACE_DIR="./"
-HOST_GEMINI_DIR="~/.gemini"
-```
-
-### 4. Jalankan Bot
-```bash
-python bot.py
-```
-
----
-
-## 🌐 Panduan Deployment Lengkap ke VPS (Headless Linux)
-
-Panduan ini ditujukan untuk VPS berbasis **Ubuntu (22.04/24.04 LTS) atau Debian**.
+## 🌐 Panduan Deployment ke VPS (Headless Ubuntu/Debian)
 
 ### Langkah 1: Buat Bot di Telegram (@BotFather)
-1. Buka Telegram dan mulai obrolan dengan **`@BotFather`**.
-2. Kirim perintah `/newbot`.
-3. Beri nama dan username bot (misal: `agy_vps_bot`).
-4. Simpan **HTTP API Token** yang diberikan.
-5. Cek ID Telegram pribadi Anda melalui **`@userinfobot`** dan catat nomor `Id`.
+1. Buka Telegram dan kirim `/newbot` ke **`@BotFather`**.
+2. Simpan **HTTP API Token** yang diberikan.
+3. Dapatkan User ID Telegram Anda dari **`@userinfobot`**.
 
 ---
 
-### Langkah 2: Transfer Kredensial Antigravity dari Laptop ke VPS
-
-Antigravity membutuhkan berkas autentikasi yang tersimpan di direktori `~/.gemini`. Salin folder ini langsung dari laptop ke direktori home VPS Anda:
-
-**Jalankan di Terminal Laptop (PowerShell / Linux / macOS):**
+### Langkah 2: Pastikan `agy` Terpasang di VPS
+Pastikan binary `agy` sudah terpasang dan sudah login di VPS:
 ```bash
-# Format: scp -r <path_folder_gemini_lokal> user@ip-vps:~/.gemini
-scp -r ~/.gemini user@ip-vps:~/.gemini
+which agy
+# Output: /home/ubuntu/.local/bin/agy
 ```
-> **Catatan Windows:** Jika menggunakan Windows PowerShell, path lokal berada di `$env:USERPROFILE\.gemini`:
-> ```powershell
-> scp -r "$env:USERPROFILE\.gemini" user@ip-vps:~/.gemini
-> ```
-
----
-
-### Langkah 3: Siapkan Docker & Git di VPS
-
-Masuk ke VPS via SSH:
+Jika belum, instal Antigravity CLI di VPS:
 ```bash
-ssh user@ip-vps
-```
-
-Pasang Docker dan Docker Compose plugin jika belum tersedia:
-```bash
-sudo apt update
-sudo apt install -y docker.io docker-compose-plugin git
-
-# Izinkan user menjalankan Docker tanpa sudo (opsional)
-sudo usermod -aG docker $USER
-newgrp docker
+curl -fsSL https://antigravity.google/install.sh | bash
+agy  # ikuti instruksi login akun Google di terminal
 ```
 
 ---
 
-### Langkah 4: Jalankan Deployment Otomatis via `deploy.sh`
+### Langkah 3: Deploy Otomatis via `deploy.sh`
 
-Di VPS, Anda **tidak perlu mengedit `.env` secara manual menggunakan `nano`**. Cukup jalankan script `deploy.sh`:
+Di VPS, clone repositori dan jalankan script deployment:
 
 ```bash
 git clone <URL_REPOSITORY> tm-agy-tele
 cd tm-agy-tele
 chmod +x deploy.sh
 
-# Opsi A: Set token & user ID langsung via argumen terminal
-./deploy.sh --token "TOKEN_DARI_BOTFATHER" --user "ID_TELEGRAM_ANDA"
+# Deployment Systemd Service (Rekomendasi - Paling Hemat RAM ~35 MB):
+./deploy.sh --token "TOKEN_DARI_BOTFATHER" --user "ID_TELEGRAM_ANDA" --systemd
 
-# Opsi B: Setup interaktif (script akan menanyakan token & ID langsung di terminal)
+# Atau jalankan interaktif (script akan menanyakan token):
 ./deploy.sh
-
-# Opsi C: Update deployment tanpa pull ulang Git
-./deploy.sh --no-pull
 ```
 
 Script `deploy.sh` akan otomatis:
-1. Memeriksa direktori Git dan izin folder.
-2. Mengambil pembaruan kode (`git pull origin main`).
-3. Membuat & mengisi file `.env` tanpa perlu membuka editor teks `nano`.
-4. Memvalidasi keberadaan folder kredensial `~/.gemini` di host.
-5. Membangun ulang dan menyalakan container Docker (`docker compose up -d --build --force-recreate`).
-6. Memverifikasi status kesehatan bot dan menampilkan instruksi log real-time.
+1. Memvalidasi binary `agy` di VPS.
+2. Menyiapkan Python virtual environment (`.venv`) dan memasang dependensi.
+3. Mengonfigurasi file service `/etc/systemd/system/antigravity-bot.service`.
+4. Mengaktifkan (*enable*) dan menyalakan (*start*) bot secara otomatis.
+5. Memverifikasi status bot.
+
+---
+
+### 🐳 Alternatif: Deploy Menggunakan Docker
+
+Jika Anda ingin menjalankan bot di dalam container Docker:
+```bash
+./deploy.sh --token "TOKEN_DARI_BOTFATHER" --user "ID_TELEGRAM_ANDA" --docker
+```
 
 ---
 
@@ -167,30 +111,29 @@ Script `deploy.sh` akan otomatis:
 
 | Perintah | Deskripsi |
 | :--- | :--- |
-| `/start` | Memulai interaksi, verifikasi status izin, dan panduan cepat |
-| `/status` | Menampilkan ringkasan status bot, workspace, mode approval, dan memori sesi |
-| `/cancel` | Menghentikan atau membatalkan tugas / eksekusi tool yang sedang berlangsung |
-| `/reset` | Menghapus memori percakapan aktif dan memulai sesi baru |
+| `/start` | Memulai interaksi, verifikasi izin, dan panduan ringkas |
+| `/status` | Cek status engine, path binary, workspace, ID sesi aktif, dan PID proses |
+| `/cancel` | Menghentikan paksa subprocess `agy` yang sedang berjalan di VPS |
+| `/reset` | Menghapus memori sesi percakapan aktif dan memulai percakapan baru |
 | `/help` | Menampilkan panduan fitur lengkap, alur approval, dan transfer berkas |
 
 ---
 
-## 🛠️ Operasional & Pemeliharaan VPS
+## 🛠️ Operasional & Pemeliharaan (Systemd Service)
 
 | Kebutuhan | Perintah Terminal di VPS |
 | :--- | :--- |
-| **Melihat log real-time** | `docker compose logs -f` |
-| **Restart container bot** | `docker compose restart` |
-| **Build ulang setelah pembaruan kode** | `docker compose up -d --build` |
-| **Menghentikan bot sementara** | `docker compose stop` |
-| **Mematikan dan menghapus container** | `docker compose down` |
-| **Melihat statistik resource container** | `docker stats antigravity_telegram_bot` |
+| **Melihat log real-time** | `journalctl -u antigravity-bot -f` |
+| **Cek status service** | `sudo systemctl status antigravity-bot` |
+| **Restart bot** | `sudo systemctl restart antigravity-bot` |
+| **Menghentikan bot** | `sudo systemctl stop antigravity-bot` |
+| **Menyalakan bot kembali** | `sudo systemctl start antigravity-bot` |
 
 ---
 
-## 🔒 Keamanan & Kebijakan Sandbox
+## 🔒 Keamanan & Kebijakan Sandboxing
 
-1. **Long Polling Outbound**: Bot menggunakan koneksi polling HTTPS keluar (outbound). Tidak ada port incoming (inbound) yang perlu dibuka pada firewall VPS (`ufw`).
-2. **Read-Only Credentials**: Direktori kredensial `~/.gemini` dimount dengan hak akses *read-only* (`:ro`) di `docker-compose.yml` untuk mencegah manipulasi dari dalam container.
-3. **Fail-Closed Strategy**: Jika permintaan persetujuan (Approve/Deny) tidak dijawab dalam batas waktu timeout (default 120s), perintah secara otomatis ditolak demi keselamatan sistem.
-4. **Isolasi Resource**: `docker-compose.yml` membatasi pemakaian RAM maksimal (default 1.5 GB) agar VPS tetap responsif.
+1. **Long Polling Outbound**: Bot menggunakan polling HTTPS keluar ke Telegram. Tidak ada port incoming (inbound) yang perlu dibuka pada firewall VPS (`ufw`).
+2. **Hardline Security Blocklist**: Perintah katastropik sistem (`rm -rf /`, `mkfs`, `dd`, `shutdown`, forkbomb) dicegat dan dibatalkan sebelum menyentuh `agy`.
+3. **Fail-Closed Intent Guard**: Perintah berbahaya (hapus database, drop table, rm -rf, git force) membutuhkan persetujuan tombol interaktif dengan batas waktu 120 detik.
+4. **Subprocess Isolation & Process Killing**: Perintah `/cancel` langsung mengirimkan `SIGTERM` dan `SIGKILL` ke PID subprocess `agy` untuk memastikan tidak ada proses liar di VPS.

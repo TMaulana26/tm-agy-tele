@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Antigravity Telegram Bot - Automated VPS Deployment Script
-# Inspired by wa-stretch-reminder & hermes-agent deployment standards
+# Native agy CLI Subprocess Engine & Systemd Service / Docker Deployer
 # ==============================================================================
 
 set -e
@@ -19,6 +19,7 @@ NC='\033[0m' # No Color
 echo ""
 echo -e "${CYAN}================================================================${NC}"
 echo -e "${CYAN}   🤖 ANTIGRAVITY TELEGRAM BOT - VPS AUTOMATED DEPLOYMENT SCRIPT ${NC}"
+echo -e "${CYAN}   Engine: Native agy CLI Subprocess (Bebas API Key & Hemat RAM) ${NC}"
 echo -e "${CYAN}================================================================${NC}"
 echo ""
 
@@ -31,8 +32,10 @@ echo -e "${BLUE}[1/6] 📁 Working directory: ${SCRIPT_DIR}${NC}"
 # Parse optional arguments
 CLI_TOKEN=""
 CLI_USER_ID=""
+CLI_AGY_PATH=""
 DO_PULL=true
 FORCE_CONFIG=false
+DEPLOY_MODE="systemd" # default mode: systemd, can be set to docker via --docker
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,6 +46,18 @@ while [[ $# -gt 0 ]]; do
         --user|-u)
             CLI_USER_ID="$2"
             shift 2
+            ;;
+        --agy-path)
+            CLI_AGY_PATH="$2"
+            shift 2
+            ;;
+        --docker)
+            DEPLOY_MODE="docker"
+            shift
+            ;;
+        --systemd)
+            DEPLOY_MODE="systemd"
+            shift
             ;;
         --no-pull)
             DO_PULL=false
@@ -59,13 +74,17 @@ while [[ $# -gt 0 ]]; do
             echo -e "${BOLD}Opsi:${NC}"
             echo "  --token, -t <TOKEN>     Set TELEGRAM_BOT_TOKEN langsung via terminal"
             echo "  --user,  -u <USER_ID>   Set ALLOWED_USER_ID langsung via terminal"
+            echo "  --agy-path <PATH>       Set path ke binary agy (default: /home/ubuntu/.local/bin/agy)"
+            echo "  --systemd               Deploy sebagai Host Systemd Service (Rekomendasi VPS, hemat RAM)"
+            echo "  --docker                Deploy menggunakan Docker Compose"
             echo "  --no-pull               Lewati 'git pull' pembaruan repository"
-            echo "  --configure, -c         Paksa input ulang token & user ID via prompt terminal"
+            echo "  --configure, -c         Paksa input ulang konfigurasi via prompt interaktif"
             echo "  --help,  -h             Tampilkan panduan bantuan ini"
             echo ""
             echo -e "${BOLD}Contoh:${NC}"
             echo "  ./deploy.sh --token \"123456:ABC...\" --user \"7163641352\""
-            echo "  ./deploy.sh --no-pull"
+            echo "  ./deploy.sh --systemd"
+            echo "  ./deploy.sh --docker"
             exit 0
             ;;
         *)
@@ -78,7 +97,7 @@ if [ "${SKIP_GIT_PULL:-false}" = "true" ]; then
     DO_PULL=false
 fi
 
-# 2. Configure Git safe directory and prepare runtime directories
+# 2. Configure Git safe directory
 echo -e "${BLUE}[2/6] 🔑 Menyiapkan izin folder & environment Git...${NC}"
 git config --global --add safe.directory "$SCRIPT_DIR" 2>/dev/null || true
 
@@ -102,7 +121,6 @@ update_env_var() {
     local file="$SCRIPT_DIR/.env"
 
     if grep -q "^${key}=" "$file" 2>/dev/null; then
-        # Replace existing variable safely using python/sed
         sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$file" 2>/dev/null || \
         sed -i "" "s|^${key}=.*|${key}=\"${value}\"|" "$file" 2>/dev/null || true
     else
@@ -128,14 +146,27 @@ if [ -n "$CLI_USER_ID" ]; then
     update_env_var "ALLOWED_USER_ID" "$CLI_USER_ID"
 fi
 
+if [ -n "$CLI_AGY_PATH" ]; then
+    echo -e "${GREEN}   ✓ Mengatur AGY_BIN_PATH dari argumen terminal.${NC}"
+    update_env_var "AGY_BIN_PATH" "$CLI_AGY_PATH"
+fi
+
 # Read current values from .env
 CURRENT_TOKEN=$(grep -E "^TELEGRAM_BOT_TOKEN=" "$SCRIPT_DIR/.env" | cut -d '=' -f2- | tr -d '"' | tr -d "'" || echo "")
 CURRENT_USER_ID=$(grep -E "^ALLOWED_USER_ID=" "$SCRIPT_DIR/.env" | cut -d '=' -f2- | tr -d '"' | tr -d "'" || echo "")
+CURRENT_AGY_PATH=$(grep -E "^AGY_BIN_PATH=" "$SCRIPT_DIR/.env" | cut -d '=' -f2- | tr -d '"' | tr -d "'" || echo "")
+
+# Auto-detect agy binary if not set
+if [ -z "$CURRENT_AGY_PATH" ]; then
+    DETECTED_AGY=$(which agy 2>/dev/null || echo "/home/ubuntu/.local/bin/agy")
+    update_env_var "AGY_BIN_PATH" "$DETECTED_AGY"
+    CURRENT_AGY_PATH="$DETECTED_AGY"
+fi
 
 PLACEHOLDER_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
 PLACEHOLDER_USER="7163641352"
 
-# Interactive prompt if values are missing, still default placeholder, or --configure is requested
+# Interactive prompt if values are missing or placeholder
 IS_INTERACTIVE=false
 if [ -t 0 ]; then
     IS_INTERACTIVE=true
@@ -174,82 +205,125 @@ if [ "$FORCE_CONFIG" = true ] || [ -z "$CURRENT_TOKEN" ] || [ "$CURRENT_TOKEN" =
     fi
 fi
 
-# Check Antigravity credentials in host
-echo -e "${BLUE}[5/6] 🔐 Memeriksa folder kredensial Antigravity host...${NC}"
-HOST_GEMINI_DIR="${HOME}/.gemini"
-if [ -d "$HOST_GEMINI_DIR" ]; then
-    echo -e "${GREEN}   ✓ Folder kredensial ${HOST_GEMINI_DIR} ditemukan di host.${NC}"
+# 5. Check agy binary existence
+echo -e "${BLUE}[5/6] 🔍 Memeriksa binary agy di sistem host...${NC}"
+if [ -f "$CURRENT_AGY_PATH" ] || command -v "$CURRENT_AGY_PATH" >/dev/null 2>&1; then
+    echo -e "${GREEN}   ✓ Binary agy ditemukan di: ${CURRENT_AGY_PATH}${NC}"
 else
-    echo -e "${YELLOW}⚠️  Folder kredensial Antigravity (${HOST_GEMINI_DIR}) belum ditemukan di server ini.${NC}"
-    echo -e "${YELLOW}   Agar bot bisa langsung terotentikasi tanpa login ulang di VPS, salin folder dari laptop:${NC}"
-    echo -e "${CYAN}   scp -r ~/.gemini $(whoami)@$(hostname -I 2>/dev/null | awk '{print $1}' || echo "ip-vps"):~/.gemini${NC}"
+    echo -e "${YELLOW}⚠️  Binary agy belum ditemukan di path: ${CURRENT_AGY_PATH}${NC}"
+    echo -e "${YELLOW}   Pastikan Antigravity CLI telah terpasang di VPS:${NC}"
+    echo -e "${CYAN}   curl -fsSL https://antigravity.google/install.sh | bash${NC}"
 fi
 
-# 6. Rebuild and restart Docker containers
-echo -e "${BLUE}[6/6] 🐳 Rebuilding and restarting Docker containers...${NC}"
-CONTAINER_NAME="antigravity_telegram_bot"
+# 6. Execute deployment
+echo -e "${BLUE}[6/6] 🚀 Menjalankan deployment (Mode: ${DEPLOY_MODE})...${NC}"
 
-# Stop and remove old container if exists
-sudo docker stop "$CONTAINER_NAME" 2>/dev/null || docker stop "$CONTAINER_NAME" 2>/dev/null || true
-sudo docker rm "$CONTAINER_NAME" 2>/dev/null || docker rm "$CONTAINER_NAME" 2>/dev/null || true
+if [ "$DEPLOY_MODE" = "systemd" ]; then
+    # ==============================================================================
+    # SYSTEMD SERVICE DEPLOYMENT (HOST NATIVE)
+    # ==============================================================================
+    CURRENT_USER=$(whoami)
+    SERVICE_FILE="/etc/systemd/system/antigravity-bot.service"
 
-# Determine docker compose binary
-DOCKER_CMD=""
-if command -v docker >/dev/null 2>&1; then
-    if sudo docker compose version >/dev/null 2>&1; then
-        DOCKER_CMD="sudo docker compose"
-    elif docker compose version >/dev/null 2>&1; then
-        DOCKER_CMD="docker compose"
-    elif sudo docker-compose version >/dev/null 2>&1; then
-        DOCKER_CMD="sudo docker-compose"
-    elif command -v docker-compose >/dev/null 2>&1; then
-        DOCKER_CMD="docker-compose"
+    echo -e "   Menyiapkan Python virtual environment di ${SCRIPT_DIR}/.venv ..."
+    if [ ! -d "${SCRIPT_DIR}/.venv" ]; then
+        python3 -m venv "${SCRIPT_DIR}/.venv" || sudo apt update && sudo apt install -y python3-venv && python3 -m venv "${SCRIPT_DIR}/.venv"
     fi
-fi
 
-if [ -z "$DOCKER_CMD" ]; then
-    echo -e "${RED}❌ Docker atau Docker Compose tidak ditemukan di server ini!${NC}"
-    echo -e "${YELLOW}Silakan pasang docker terlebih dahulu:${NC}"
-    echo "  sudo apt update && sudo apt install -y docker.io docker-compose-plugin"
-    exit 1
-fi
+    echo -e "   Menginstal dependensi via pip..."
+    "${SCRIPT_DIR}/.venv/bin/pip" install --upgrade pip >/dev/null 2>&1 || true
+    "${SCRIPT_DIR}/.venv/bin/pip" install -r "${SCRIPT_DIR}/requirements.txt"
 
-echo -e "   Menjalankan: ${CYAN}${DOCKER_CMD} up -d --build --force-recreate${NC}"
-$DOCKER_CMD up -d --build --force-recreate
+    echo -e "   Membuat systemd service di ${SERVICE_FILE}..."
+    sudo bash -c "cat > ${SERVICE_FILE}" <<EOF
+[Unit]
+Description=Antigravity Telegram Bot (Native agy CLI Engine)
+After=network.target
 
-# 7. Verify container status
-echo -e "${BLUE}🩺 Memverifikasi status container...${NC}"
-sleep 2
+[Service]
+Type=simple
+User=${CURRENT_USER}
+WorkingDirectory=${SCRIPT_DIR}
+EnvironmentFile=${SCRIPT_DIR}/.env
+ExecStart=${SCRIPT_DIR}/.venv/bin/python ${SCRIPT_DIR}/bot.py
+Restart=always
+RestartSec=5
 
-STATE=$(sudo docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "not_found")
+[Install]
+WantedBy=multi-user.target
+EOF
 
-if [ "$STATE" = "running" ]; then
-    echo ""
-    echo -e "${GREEN}================================================================${NC}"
-    echo -e "${GREEN}  🎉 DEPLOYMENT BERHASIL! ANTIGRAVITY BOT AKTIF 🎉              ${NC}"
-    echo -e "${GREEN}================================================================${NC}"
-    echo ""
-    sudo docker ps --filter "name=$CONTAINER_NAME" 2>/dev/null || docker ps --filter "name=$CONTAINER_NAME"
-    echo ""
-    echo -e "${CYAN}📌 Langkah Operasional & Pemantauan:${NC}"
-    echo -e "  • Pantau log & aktivitas bot   : ${YELLOW}${DOCKER_CMD} logs -f${NC}"
-    echo -e "  • Restart bot                   : ${YELLOW}${DOCKER_CMD} restart${NC}"
-    echo -e "  • Hentikan bot                  : ${YELLOW}${DOCKER_CMD} down${NC}"
-    echo -e "  • Cek penggunaan CPU & RAM      : ${YELLOW}sudo docker stats $CONTAINER_NAME${NC}"
-    echo ""
-    echo -e "${GREEN}Silakan buka bot di Telegram lalu ketik /start untuk mulai bercakap-cakap!${NC}"
-    echo ""
+    echo -e "   Mengaktifkan & menjalankan service..."
+    sudo systemctl daemon-reload
+    sudo systemctl enable antigravity-bot
+    sudo systemctl restart antigravity-bot
+
+    sleep 2
+    if sudo systemctl is-active --quiet antigravity-bot; then
+        echo ""
+        echo -e "${GREEN}================================================================${NC}"
+        echo -e "${GREEN}  🎉 DEPLOYMENT SYSTEMD BERHASIL! BOT AKTIF 🎉                  ${NC}"
+        echo -e "${GREEN}================================================================${NC}"
+        echo ""
+        echo -e "${CYAN}📌 Langkah Operasional & Pemantauan:${NC}"
+        echo -e "  • Cek status service   : ${YELLOW}sudo systemctl status antigravity-bot${NC}"
+        echo -e "  • Pantau log realtime  : ${YELLOW}journalctl -u antigravity-bot -f${NC}"
+        echo -e "  • Restart bot          : ${YELLOW}sudo systemctl restart antigravity-bot${NC}"
+        echo -e "  • Hentikan bot         : ${YELLOW}sudo systemctl stop antigravity-bot${NC}"
+        echo ""
+        echo -e "${GREEN}Silakan buka bot di Telegram lalu ketik /start untuk mulai bercakap-cakap!${NC}"
+        echo ""
+    else
+        echo ""
+        echo -e "${RED}================================================================${NC}"
+        echo -e "${RED}  ❌ DEPLOYMENT GAGAL: Service gagal boot!                      ${NC}"
+        echo -e "${RED}================================================================${NC}"
+        sudo journalctl -u antigravity-bot -n 30 --no-pager
+        exit 1
+    fi
+
 else
-    echo ""
-    echo -e "${RED}================================================================${NC}"
-    echo -e "${RED}  ❌ DEPLOYMENT GAGAL: Container berhenti atau gagal boot!      ${NC}"
-    echo -e "${RED}================================================================${NC}"
-    echo -e "${YELLOW}Log terakhir container (${CONTAINER_NAME}):${NC}"
-    sudo docker logs --tail 40 "$CONTAINER_NAME" 2>/dev/null || docker logs --tail 40 "$CONTAINER_NAME" 2>/dev/null || true
-    echo ""
-    echo -e "${YELLOW}Tips Troubleshooting:${NC}"
-    echo "  1. Pastikan TELEGRAM_BOT_TOKEN di .env sudah valid."
-    echo "  2. Pastikan port/koneksi outbound ke api.telegram.org tidak diblokir firewall."
-    echo "  3. Cek log lengkap dengan: ${DOCKER_CMD} logs"
-    exit 1
+    # ==============================================================================
+    # DOCKER DEPLOYMENT
+    # ==============================================================================
+    CONTAINER_NAME="antigravity_telegram_bot"
+
+    sudo docker stop "$CONTAINER_NAME" 2>/dev/null || docker stop "$CONTAINER_NAME" 2>/dev/null || true
+    sudo docker rm "$CONTAINER_NAME" 2>/dev/null || docker rm "$CONTAINER_NAME" 2>/dev/null || true
+
+    DOCKER_CMD=""
+    if command -v docker >/dev/null 2>&1; then
+        if sudo docker compose version >/dev/null 2>&1; then
+            DOCKER_CMD="sudo docker compose"
+        elif docker compose version >/dev/null 2>&1; then
+            DOCKER_CMD="docker compose"
+        fi
+    fi
+
+    if [ -z "$DOCKER_CMD" ]; then
+        echo -e "${RED}❌ Docker Compose tidak ditemukan di server ini!${NC}"
+        exit 1
+    fi
+
+    echo -e "   Menjalankan: ${CYAN}${DOCKER_CMD} up -d --build --force-recreate${NC}"
+    $DOCKER_CMD up -d --build --force-recreate
+
+    sleep 2
+    STATE=$(sudo docker inspect --format='{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "not_found")
+    if [ "$STATE" = "running" ]; then
+        echo ""
+        echo -e "${GREEN}================================================================${NC}"
+        echo -e "${GREEN}  🎉 DEPLOYMENT DOCKER BERHASIL! CONTAINER AKTIF 🎉             ${NC}"
+        echo -e "${GREEN}================================================================${NC}"
+        echo ""
+        echo -e "${CYAN}📌 Langkah Operasional & Pemantauan:${NC}"
+        echo -e "  • Pantau log & aktivitas bot   : ${YELLOW}${DOCKER_CMD} logs -f${NC}"
+        echo -e "  • Restart bot                   : ${YELLOW}${DOCKER_CMD} restart${NC}"
+        echo -e "  • Hentikan bot                  : ${YELLOW}${DOCKER_CMD} down${NC}"
+        echo ""
+    else
+        echo -e "${RED}❌ Container gagal berjalan.${NC}"
+        sudo docker logs --tail 40 "$CONTAINER_NAME" 2>/dev/null || true
+        exit 1
+    fi
 fi

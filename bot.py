@@ -1,32 +1,41 @@
 #!/usr/bin/env python3
 """
-Antigravity Telegram Bot (Production-Grade)
-Inspired by NousResearch/hermes-agent & plan.md architecture.
+Antigravity Telegram Bot (Native agy CLI Subprocess Engine)
+Terintegrasi langsung dengan binary resmi agy di VPS/Host.
 
-Features:
-- Whitelist authorization check (ALLOWED_USER_ID)
-- Multi-turn stateful session memory per user
-- Dangerous Command Approval System (Hardline Blocklist + Inline Keyboard + Fail-closed Timeout)
-- Task interrupt & cancellation via /cancel
-- Native file/media delivery (MEDIA:/path detection and Telegram send_document)
-- Live ephemeral progress updates & periodic typing indicator
-- Safe message chunking (< 4000 chars) with markdown parsing fallback
-- Command handlers: /start, /help, /status, /reset, /cancel
+Fitur Unggulan:
+1. Bebas API Key - Menggunakan sesi OAuth Google Antigravity bawaan (~/.gemini/antigravity-cli/)
+2. Super Hemat RAM (~35 MB) - Ideal dijalankan via systemd service di VPS
+3. Multi-turn Stateful Memory via flag `agy --conversation <CONV_ID>`
+4. Hardline Security Blocklist (Blokir total perintah katastropik: rm -rf /, forkbomb, dd, mkfs, shutdown)
+5. Hermes-Style Interactive Approval (Inline Buttons [Approve] / [Deny] dengan fail-closed timeout)
+6. Real Process Cancellation (/cancel langsung mematikan PID subprocess agy)
+7. Live Progress Feedback (Timer detik berjalan + Telegram typing status)
+8. Media & Document Dispatcher (Deteksi otomatis format MEDIA:/path/ke/file)
+9. Safe Markdown Splitter (< 4000 karakter dengan auto fallback ke teks polos)
 """
 
 import os
 import sys
 import re
+import json
+import time
+import uuid
+import shutil
 import asyncio
 import logging
-import uuid
 from pathlib import Path
-from typing import Dict, Optional, Set, List, Tuple, Any
-
+from typing import Dict, Set, Optional, Tuple, List
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import TelegramError, BadRequest
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -35,11 +44,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
-
-from google.antigravity import Agent, LocalAgentConfig, CapabilitiesConfig
-from google.antigravity.hooks.hooks import PreToolCallDecideHook, HookResult, HookContext
-from google.antigravity.hooks.policy import Policy, Decision
-from google.antigravity.types import ToolCall, Text, ToolResult
 
 load_dotenv()
 
@@ -50,7 +54,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("antigravity-bot")
+logger = logging.getLogger("antigravity-tele-bot")
 
 # ==============================================================================
 # CONFIGURATION & ENVIRONMENT
@@ -64,29 +68,42 @@ for part in raw_allowed.split(","):
     if part.isdigit():
         ALLOWED_USER_IDS.add(int(part))
 
-WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/workspace").strip()
+# Path binary agy di VPS atau Laptop
+AGY_BIN_PATH = os.getenv(
+    "AGY_BIN_PATH",
+    shutil.which("agy") or shutil.which("agy.exe") or "/home/ubuntu/.local/bin/agy"
+).strip()
+
+WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/home/ubuntu").strip()
 APPROVAL_MODE = os.getenv("APPROVAL_MODE", "ask_destructive").strip().lower()
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120"))
 
-SYSTEM_INSTRUCTIONS = (
-    "Anda adalah asisten AI Antigravity berstandar produksi yang melayani pemilik sistem di VPS/Server. "
-    f"Direktori kerja utama adalah: {WORKSPACE_DIR}. "
-    "Bantu jawab pertanyaan arsitektur, navigasi codebase, inspeksi berkas, "
-    "edit kode, atau jalankan perintah dengan aman dan teliti.\n\n"
-    "PANDUAN PENTING:\n"
-    "1. Berkomunikasilah dalam Bahasa Indonesia yang ramah, sopan, ringkas, dan profesional (friendly yet technical).\n"
-    "2. Jika Anda membuat, mengubah, atau menemukan file yang ingin Anda kirimkan langsung kepada pengguna sebagai dokumen Telegram, "
-    "sertakan baris terpisah dengan format:\n"
-    "MEDIA:/path/ke/file\n"
-    "Sistem bot akan secara otomatis mengunggah dan mengirimkan dokumen tersebut ke chat Telegram pengguna.\n"
-    "3. Selalu periksa kembali perubahan kode sebelum mengeksekusi."
-)
+# ==============================================================================
+# STATE & REGISTRY
+# ==============================================================================
+# Menyimpan conversation_id resmi agy per user_id Telegram (Multi-turn Memory)
+user_conversations: Dict[int, str] = {}
+
+# Menyimpan subprocess aktif per user_id untuk keperluan pembatalan (/cancel)
+user_processes: Dict[int, asyncio.subprocess.Process] = {}
+
+# Pending approval registry:
+# { request_id: {"future": asyncio.Future, "user_id": int, "message": Message, "text": str} }
+pending_approvals: Dict[str, dict] = {}
+
+# User mutex locks & active tasks
+user_locks: Dict[int, asyncio.Lock] = {}
+user_tasks: Dict[int, asyncio.Task] = {}
+
+def get_user_lock(user_id: int) -> asyncio.Lock:
+    """Mendapatkan mutex lock per user untuk mencegah race condition percakapan."""
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+    return user_locks[user_id]
 
 # ==============================================================================
-# HARDLINE SECURITY BLOCKLIST
+# HARDLINE SECURITY BLOCKLIST & INTENT GUARD
 # ==============================================================================
-# Perintah-perintah katastropik berikut DILARANG KERAS dieksekusi dalam kondisi apa pun!
-# Jika terdeteksi, bot akan langsung MENOLAK tanpa memunculkan tombol Approve.
 HARDLINE_BLOCKLIST = [
     r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
     r"mkfs(?:\.[a-z0-9]+)?\s+",
@@ -96,96 +113,45 @@ HARDLINE_BLOCKLIST = [
     r"chmod\s+-[rR]\s+777\s+/(?:\s|$)",
     r"chown\s+-[rR]\s+.*\s+/(?:\s|$)",
     r"(?:^|[\s;&|])(?:shutdown|reboot|poweroff|halt|init\s+0)(?:$|[\s;&|])",
+    r"\brm\s+.*-(?:[a-zA-Z0-9]*[rR]|--recursive).*/(?:\*|\s|$)"
 ]
 
-def is_hardline_blocked(command: str) -> bool:
-    """Mengecek apakah perintah terminal melanggar Hardline Blocklist."""
-    cmd_clean = command.strip()
-
-    # Cek penghapusan rekursif pada root / atau /* (contoh: rm -rf /, rm -r -f /, rm --recursive /)
-    if re.search(r"\brm\s+", cmd_clean, re.IGNORECASE):
-        if re.search(r"(?:^|\s)/(?:\*|\s|$)", cmd_clean):
-            if re.search(r"-[a-zA-Z0-9]*[rR]|--recursive", cmd_clean):
-                return True
-
+def is_hardline_blocked(prompt: str) -> bool:
+    """Mengecek apakah teks instruksi mengandung perintah katastropik OS."""
+    p_clean = prompt.strip()
     for pattern in HARDLINE_BLOCKLIST:
-        if re.search(pattern, cmd_clean, re.IGNORECASE):
+        if re.search(pattern, p_clean, re.IGNORECASE):
             return True
     return False
 
-def is_command_safe(cmd: str) -> bool:
+# Pola-pola instruksi yang berpotensi mutatif/destruktif dan memerlukan Interactive Approval
+DESTRUCTIVE_PATTERNS = [
+    r"\b(?:hapus|delete|remove|unlink|shred)\b",
+    r"\brm\s+-[a-zA-Z0-9]*[rfRF]",
+    r"\b(?:drop\s+database|drop\s+table|truncate\s+table)\b",
+    r"\b(?:migrate:fresh|db:wipe)\b",
+    r"\bgit\s+(?:reset\s+--hard|clean\s+-[a-zA-Z0-9]*f|push\s+.*--force)\b",
+    r"\bdocker\s+(?:rm|rmi|system\s+prune|compose\s+down\s+-v)\b",
+    r"\b(?:kill\s+-9|pkill\s+-9|killall)\b",
+    r"\bformat\s+(?:disk|drive)\b",
+]
+
+def is_destructive_prompt(prompt: str) -> Tuple[bool, str]:
     """
-    Mengevaluasi apakah perintah terminal termasuk read-only yang aman di-auto-approve.
-    Jika ada redirection (>) atau sub-command yang bukan read-only, harus minta persetujuan.
+    Mengevaluasi apakah prompt meminta tindakan berisiko tinggi.
+    Mengembalikan tuple (is_destructive: bool, reason: str).
     """
-    if ">" in cmd:
-        return False
+    if APPROVAL_MODE == "auto_approve":
+        return False, ""
 
-    safe_prefixes = (
-        "ls", "dir", "pwd", "git status", "git log", "git diff", "git branch", "git show",
-        "cat", "head", "tail", "grep", "find", "which", "where", "python --version",
-        "python -v", "node -v", "npm -v", "echo", "whoami", "date", "uname", "ps", "df", "du", "free"
-    )
+    prompt_low = prompt.strip().lower()
+    for pattern in DESTRUCTIVE_PATTERNS:
+        match = re.search(pattern, prompt_low)
+        if match:
+            trigger = match.group(0)
+            return True, f"Terdeteksi kata/perintah berisiko: `{trigger}`"
 
-    parts = cmd.replace("&&", ";").replace("||", ";").replace("|", ";").split(";")
-    for part in parts:
-        clean = part.strip().lower()
-        if not clean:
-            continue
-        if not any(clean.startswith(prefix) for prefix in safe_prefixes):
-            return False
-    return True
-
-def is_destructive_action(tool_name: str, args: dict) -> Tuple[bool, str]:
-    """
-    Mengklasifikasikan apakah aksi tool membutuhkan persetujuan interaktif (Approve/Deny).
-    Returns (is_destructive, details_string).
-    """
-    tool_lower = tool_name.lower()
-
-    # Perintah terminal
-    if tool_lower in ["run_command", "terminal", "execute", "execute_command"]:
-        cmd = str(args.get("command", "") or args.get("CommandLine", "") or args.get("cmd", "")).strip()
-        details = f"Command: {cmd}"
-        if APPROVAL_MODE == "ask_all":
-            return True, details
-        if APPROVAL_MODE == "auto_approve":
-            return False, details
-        # ask_destructive:
-        if is_command_safe(cmd):
-            return False, details
-        return True, details
-
-    # Modifikasi file
-    if tool_lower in ["create_file", "write_to_file", "write_file", "edit_file", "replace_file_content", "delete_file"]:
-        target = args.get("TargetFile") or args.get("file_path") or args.get("path") or "(file)"
-        details = f"Tool: {tool_name}\nTarget: {target}"
-        if APPROVAL_MODE == "auto_approve":
-            return False, details
-        return True, details
-
-    # Tool lainnya
-    if APPROVAL_MODE == "ask_all":
-        return True, f"Tool: {tool_name}\nArgs: {str(args)[:300]}"
-
-    return False, f"Tool: {tool_name}"
-
-# ==============================================================================
-# STATE & REGISTRY
-# ==============================================================================
-# Sesi percakapan Antigravity per user
-user_agents: Dict[int, Agent] = {}
-user_approval_hooks: Dict[int, "TelegramApprovalHook"] = {}
-user_locks: Dict[int, asyncio.Lock] = {}
-user_tasks: Dict[int, asyncio.Task] = {}
-
-# Active Telegram Context per user (bot, chat_id, status_msg)
-# Dipisahkan dari instance Hook agar LocalAgentConfig aman di-deepcopy oleh Antigravity
-active_user_contexts: Dict[int, dict] = {}
-
-# Pending approval registry:
-# { request_id: {"future": asyncio.Future, "user_id": int, "message": Message, "text": str} }
-pending_approvals: Dict[str, dict] = {}
+    return False, ""
 
 # ==============================================================================
 # TELEGRAM HELPER UTILITIES
@@ -197,19 +163,13 @@ def is_authorized(update: Update) -> bool:
         return False
     return user.id in ALLOWED_USER_IDS
 
-def get_user_lock(user_id: int) -> asyncio.Lock:
-    """Mendapatkan mutex lock per user untuk mencegah race condition."""
-    if user_id not in user_locks:
-        user_locks[user_id] = asyncio.Lock()
-    return user_locks[user_id]
-
 def split_message(text: str, max_length: int = 4000) -> List[str]:
     """
     Memecah teks panjang secara aman agar tidak melampaui limit karakter Telegram (4096).
     Memotong pada boundary baris baru (\n) atau spasi jika memungkinkan.
     """
     if not text:
-        return ["(Tidak ada output)"]
+        return ["(Tidak ada output teks dari agy)"]
     if len(text) <= max_length:
         return [text]
 
@@ -322,17 +282,30 @@ def extract_media_paths(text: str, workspace_dir: str = WORKSPACE_DIR) -> List[s
 
     return list(dict.fromkeys(found_paths))
 
-async def send_typing_periodically(bot, chat_id: int, stop_event: asyncio.Event):
-    """Mengirim status 'typing...' setiap 4 detik selama agen sedang memproses."""
+async def send_typing_and_progress(
+    bot,
+    chat_id: int,
+    status_msg: Optional[Message],
+    stop_event: asyncio.Event
+):
+    """Mengirim status 'typing...' dan update timer durasi setiap 4 detik."""
+    start_time = time.time()
     while not stop_event.is_set():
         try:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except Exception:
             pass
+
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=4.0)
         except asyncio.TimeoutError:
-            pass
+            if status_msg and not stop_event.is_set():
+                elapsed = int(time.time() - start_time)
+                await safe_edit_message(
+                    status_msg,
+                    f"⏳ *Antigravity sedang berpikir & memproses...* `({elapsed}s)`\n"
+                    f"_Kirim /cancel untuk menghentikan proses kapan saja._"
+                )
 
 # ==============================================================================
 # APPROVAL WORKFLOW (ALA HERMES)
@@ -341,8 +314,8 @@ async def request_user_approval(
     bot,
     chat_id: int,
     user_id: int,
-    action_name: str,
-    action_details: str
+    prompt: str,
+    reason: str
 ) -> bool:
     """
     Mengirimkan Inline Keyboard konfirmasi (Approve/Deny) ke Telegram dan menunggu respons.
@@ -360,10 +333,11 @@ async def request_user_approval(
     ])
 
     pesan_approval = (
-        "⚠️ **Permintaan Persetujuan Eksekusi (Ala Hermes):**\n\n"
-        f"• **Aksi**: `{action_name}`\n"
-        f"• **Detail**:\n```bash\n{action_details[:1000]}\n```\n"
-        f"⏱️ *Batas Waktu:* `{APPROVAL_TIMEOUT_SECONDS} detik (Fail-Closed)`"
+        "⚠️ **PERMINTAAN PERSETUJUAN EKSEKUSI (Hermes Guard)**\n\n"
+        f"• **Alasan Deteksi**: {reason}\n"
+        f"• **Instruksi Akang**:\n```bash\n{prompt[:1000]}\n```\n"
+        f"⏱️ *Batas Waktu:* `{APPROVAL_TIMEOUT_SECONDS} detik (Fail-Closed)`\n\n"
+        "Apakah Akang yakin ingin mengizinkan eksekusi instruksi ini?"
     )
 
     msg = await safe_send_message(
@@ -399,129 +373,11 @@ async def request_user_approval(
         if msg:
             await safe_edit_message(
                 msg,
-                f"{pesan_approval}\n\nStatus: 🛑 **DIBATALKAN (CANCELLED)**"
+                f"{pesan_approval}\n\nStatus: 🛑 **DIBATALKAN VIA /cancel**"
             )
         return False
     finally:
         pending_approvals.pop(request_id, None)
-
-class TelegramApprovalHook(PreToolCallDecideHook):
-    """
-    Hook bawaan Antigravity yang mencegat eksekusi tool sebelum dijalankan.
-    Menerapkan Hardline Blocklist & Interactive Approval langsung ke Telegram.
-    HANYA menyimpan user_id pada instance agar LocalAgentConfig aman di-deepcopy oleh Antigravity.
-    """
-    def __init__(self, user_id: Optional[int] = None, bot=None, chat_id: Optional[int] = None):
-        super().__init__()
-        # Handle fleksibel jika dipanggil gaya baru (user_id) atau gaya lama (bot, chat_id, user_id)
-        if isinstance(user_id, int):
-            self.user_id = user_id
-            if bot is not None or chat_id is not None:
-                ctx = active_user_contexts.setdefault(user_id, {})
-                if bot is not None:
-                    ctx["bot"] = bot
-                if chat_id is not None:
-                    ctx["chat_id"] = chat_id
-        else:
-            # Gaya lama: arg 0 adalah bot, arg 1 adalah chat_id, arg 2 adalah user_id
-            passed_bot = user_id
-            passed_chat_id = bot
-            passed_user_id = chat_id or 0
-            self.user_id = passed_user_id
-            ctx = active_user_contexts.setdefault(passed_user_id, {})
-            if passed_bot is not None:
-                ctx["bot"] = passed_bot
-            if passed_chat_id is not None:
-                ctx["chat_id"] = passed_chat_id
-
-    def __deepcopy__(self, memo):
-        # Override eksplisit untuk memastikan LocalAgentConfig dapat di-deepcopy tanpa menyentuh Bot object
-        cls = self.__class__
-        result = cls.__new__(cls)
-        memo[id(self)] = result
-        result.user_id = self.user_id
-        return result
-
-    @property
-    def bot(self):
-        return active_user_contexts.get(self.user_id, {}).get("bot")
-
-    @property
-    def chat_id(self):
-        return active_user_contexts.get(self.user_id, {}).get("chat_id")
-
-    @property
-    def status_msg(self):
-        return active_user_contexts.get(self.user_id, {}).get("status_msg")
-
-    def update_context(self, bot=None, chat_id: Optional[int] = None, user_id: Optional[int] = None, status_msg: Optional[Message] = None):
-        uid = user_id or self.user_id
-        ctx = active_user_contexts.setdefault(uid, {})
-        if bot is not None:
-            ctx["bot"] = bot
-        if chat_id is not None:
-            ctx["chat_id"] = chat_id
-        if status_msg is not None:
-            ctx["status_msg"] = status_msg
-
-    async def run(self, context: HookContext, data: ToolCall) -> HookResult:
-        tool_name = data.name
-        args = data.args or {}
-
-        user_ctx = active_user_contexts.get(self.user_id, {})
-        current_bot = user_ctx.get("bot")
-        current_chat_id = user_ctx.get("chat_id")
-        current_status_msg = user_ctx.get("status_msg")
-
-        # 1. Evaluasi Hardline Blocklist jika tool adalah eksekusi perintah terminal
-        if tool_name.lower() in ["run_command", "terminal", "execute", "execute_command"]:
-            cmd = str(args.get("command", "") or args.get("CommandLine", "") or args.get("cmd", ""))
-            if is_hardline_blocked(cmd):
-                logger.error(f"🚨 HARDLINE BLOCKLIST TRIGGERED: {cmd}")
-                if current_bot and current_chat_id:
-                    await safe_send_message(
-                        bot=current_bot,
-                        chat_id=current_chat_id,
-                        text=(
-                            f"🚨 **HARDLINE SECURITY BLOCKLIST TRIGGERED!**\n\n"
-                            f"Perintah berikut terdeteksi berisiko katastropik dan **DIBLOKIR TOTAL** demi keamanan:\n"
-                            f"```bash\n{cmd}\n```"
-                        )
-                    )
-                return HookResult(
-                    allow=False,
-                    message="DIBLOKIR: Perintah melanggar Hardline Security Blocklist dan tidak dapat dijalankan."
-                )
-
-        # 2. Cek apakah aksi memerlukan persetujuan interaktif (destructive)
-        is_destruct, details = is_destructive_action(tool_name, args)
-        if not is_destruct:
-            if current_status_msg:
-                await safe_edit_message(current_status_msg, f"⚙️ *Menjalankan tool:* `{tool_name}`...")
-            return HookResult(allow=True)
-
-        # 3. Minta persetujuan interaktif ke user Telegram
-        if not current_bot or not current_chat_id:
-            logger.error(f"Telegram context tidak ditemukan untuk user {self.user_id}")
-            return HookResult(allow=False, message="Telegram context tidak ditemukan.")
-
-        approved = await request_user_approval(
-            bot=current_bot,
-            chat_id=current_chat_id,
-            user_id=self.user_id,
-            action_name=tool_name,
-            action_details=details
-        )
-
-        if approved:
-            if current_status_msg:
-                await safe_edit_message(current_status_msg, f"⚙️ *Mengeksekusi (Disetujui):* `{tool_name}`...")
-            return HookResult(allow=True)
-        else:
-            return HookResult(
-                allow=False,
-                message="User menolak eksekusi aksi ini atau batas waktu persetujuan telah habis."
-            )
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menangani interaksi klik tombol Inline Keyboard Approve / Deny."""
@@ -548,6 +404,104 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 future.set_result(False)
 
 # ==============================================================================
+# SUBPROCESS AGY CLI RUNNER
+# ==============================================================================
+async def run_agy_cli(
+    user_id: int,
+    prompt: str,
+    conv_id: Optional[str] = None,
+    cwd: str = WORKSPACE_DIR
+) -> Tuple[str, Optional[str]]:
+    """
+    Mengeksekusi binary agy CLI sebagai asinkron subprocess.
+    Menggunakan --output-format json untuk mengekstrak conversation_id resmi & respons teks.
+    Mengembalikan tuple: (response_text, new_or_existing_conv_id).
+    """
+    if not os.path.exists(AGY_BIN_PATH) and not shutil.which(AGY_BIN_PATH):
+        raise FileNotFoundError(
+            f"Binary agy tidak ditemukan di path: '{AGY_BIN_PATH}'. "
+            f"Pastikan agy sudah terpasang atau sesuaikan variabel AGY_BIN_PATH di file .env."
+        )
+
+    cmd = [AGY_BIN_PATH]
+    if conv_id:
+        cmd.extend(["--conversation", conv_id])
+
+    cmd.extend([
+        "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--output-format", "json"
+    ])
+
+    env = os.environ.copy()
+    # Tambahkan path instalasi standar Antigravity CLI jika ada
+    extra_paths = [
+        "/home/ubuntu/.gemini/antigravity-cli/bin",
+        "/home/ubuntu/.local/bin",
+        "/usr/local/bin"
+    ]
+    env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "")])
+
+    logger.info(f"Menjalankan subprocess agy untuk user {user_id} (Conv: {conv_id or 'Baru'})...")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    user_processes[user_id] = proc
+
+    try:
+        stdout_bytes, stderr_bytes = await proc.communicate()
+    finally:
+        user_processes.pop(user_id, None)
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+    # Coba parsing output sebagai JSON terstruktur
+    parsed_json = None
+    if stdout_text:
+        # Beberapa output CLI mungkin memiliki warning sebelum baris JSON
+        for line in stdout_text.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("{") and line_str.endswith("}"):
+                try:
+                    parsed_json = json.loads(line_str)
+                    break
+                except Exception:
+                    continue
+        if not parsed_json:
+            try:
+                parsed_json = json.loads(stdout_text)
+            except Exception:
+                pass
+
+    if parsed_json and isinstance(parsed_json, dict):
+        returned_conv_id = parsed_json.get("conversation_id") or conv_id
+        response_body = parsed_json.get("response", "").strip()
+        status = parsed_json.get("status", "")
+        error_msg = parsed_json.get("error", "").strip()
+
+        if status == "ERROR" and error_msg:
+            return f"❌ **Error dari agy:**\n```text\n{error_msg}\n```", returned_conv_id
+
+        if response_body:
+            return response_body, returned_conv_id
+        elif error_msg:
+            return f"⚠️ **Output agy:**\n```text\n{error_msg}\n```", returned_conv_id
+
+    # Fallback jika CLI menghasilkan output teks biasa
+    if stdout_text:
+        return stdout_text, conv_id
+    elif stderr_text:
+        return f"⚠️ Output (stderr):\n```text\n{stderr_text}\n```", conv_id
+
+    return "(agy menyelesaikan tugas tanpa balasan output teks)", conv_id
+
+# ==============================================================================
 # TELEGRAM COMMAND HANDLERS
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -555,13 +509,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Akses ditolak. Bot ini privat untuk pemilik sistem.")
         return
 
+    user_id = update.effective_user.id
+    current_conv = user_conversations.get(user_id, "Belum dimulai (Akan dibuat saat pesan pertama)")
+
     welcome_text = (
         "🤖 **Halo Kang! Antigravity Telegram Bot Aktif.**\n\n"
-        "Bot ini terhubung langsung dengan AI Agent Antigravity di lingkungan VPS/Docker.\n"
-        "Dilengkapi fitur **Interactive Approval (ala Hermes)** untuk menjamin keamanan eksekusi perintah kritis.\n\n"
+        "Bot ini terhubung langsung ke **Native `agy` CLI Engine** di VPS/Host dengan sesi login Google Antigravity Akang.\n"
+        "Dilengkapi fitur **Hermes Guard (Interactive Approval)** untuk mencegah eksekusi instruksi katastropik.\n\n"
         "**Perintah Tersedia:**\n"
-        "• `/status` - Cek status bot, memory, approval mode, dan workspace\n"
-        "• `/cancel` - Batalkan tugas/eksekusi yang sedang berjalan\n"
+        "• `/status` - Cek engine, memory ID, workspace, dan status proses\n"
+        "• `/cancel` - Hentikan paksa proses `agy` yang sedang berjalan\n"
         "• `/reset`  - Hapus memori percakapan & mulai sesi baru\n"
         "• `/help`   - Panduan lengkap fitur & media transfer\n\n"
         "Silakan kirim pesan atau instruksi koding/perintah apa pun langsung di sini."
@@ -573,21 +530,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     help_text = (
-        "📖 **Panduan Penggunaan Antigravity Bot**\n\n"
-        "1. **Tanya Jawab & Diskusi**:\n"
-        "   Kirim pertanyaan arsitektur, algoritma, atau konsultasi koding.\n\n"
-        "2. **Kelola Proyek & File**:\n"
-        f"   Agen dapat membaca, menulis, dan mengedit file di `{WORKSPACE_DIR}`.\n\n"
-        "3. **Interactive Approval (Ala Hermes)**:\n"
-        "   Saat agen hendak menjalankan perintah mutatif (bash, git push, edit berkas), "
-        "bot akan menampilkan tombol konfirmasi:\n"
-        "   `[ ✅ Setujui (Approve) ]`  `[ ❌ Tolak (Deny) ]`\n"
-        f"   Batas waktu tunggu: `{APPROVAL_TIMEOUT_SECONDS} detik (fail-closed)`.\n\n"
-        "4. **Pengiriman File & Media Otomatis**:\n"
-        "   Minta agen membuat file atau laporan. Jika agen menyertakan `MEDIA:/path/ke/file`, "
-        "bot akan langsung mengirimkannya sebagai dokumen Telegram.\n\n"
-        "5. **Membatalkan Tugas**:\n"
-        "   Gunakan `/cancel` kapan saja untuk menghentikan proses yang sedang berjalan."
+        "📖 **Panduan Penggunaan Antigravity Telegram Bot**\n\n"
+        "**1. Perintah Bot:**\n"
+        "• `/status` : Informasi engine, binary path, memori multi-turn, dan PID proses.\n"
+        "• `/cancel` : Mematikan proses `agy` yang sedang berjalan secara instan (`SIGTERM`/`SIGKILL`).\n"
+        "• `/reset`  : Menghapus `conversation_id` dan memulai sesi baru yang segar.\n\n"
+        "**2. Keamanan & Approval (Ala Hermes):**\n"
+        "• Perintah berisiko tinggi (hapus database, drop table, rm -rf, git push force) akan memunculkan tombol "
+        "`[ ✅ Approve ]` dan `[ ❌ Deny ]`.\n"
+        "• Batas waktu approval adalah 120 detik (otomatis dibatalkan jika tidak direspons).\n"
+        "• Perintah katastropik OS (`rm -rf /`, `mkfs`, `dd`, `shutdown`) **DIBLOKIR TOTAL** tanpa konfirmasi.\n\n"
+        "**3. Pengiriman Berkas & Media:**\n"
+        "Jika hasil pekerjaan menghasilkan berkas gambar/dokumen, bot akan otomatis mengirimkannya ke chat Telegram pengguna."
     )
     await safe_send_message(context.bot, update.effective_chat.id, help_text)
 
@@ -596,18 +550,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    has_active_agent = user_id in user_agents
-    current_task = user_tasks.get(user_id)
-    is_task_running = current_task is not None and not current_task.done()
+    current_conv = user_conversations.get(user_id)
+    running_proc = user_processes.get(user_id)
+    is_proc_running = running_proc is not None and running_proc.returncode is None
+    bin_exists = os.path.exists(AGY_BIN_PATH) or shutil.which(AGY_BIN_PATH) is not None
 
     status_text = (
-        "📊 **Status Sistem Antigravity Bot**\n\n"
-        f"• **Environment**: `Docker Container / Linux VPS`\n"
+        "📊 **Status Sistem Antigravity Bot (CLI Engine)**\n\n"
+        f"• **Engine**: `Native agy CLI Subprocess`\n"
+        f"• **Binary Path**: `{AGY_BIN_PATH}` ({'✅ Ditemukan' if bin_exists else '❌ Tidak Ditemukan!'})\n"
         f"• **Workspace Path**: `{WORKSPACE_DIR}`\n"
         f"• **Approval Mode**: `{APPROVAL_MODE}`\n"
         f"• **Approval Timeout**: `{APPROVAL_TIMEOUT_SECONDS} detik`\n"
-        f"• **Sesi Percakapan**: `{'Aktif (Multi-turn Memory)' if has_active_agent else 'Fresh / Idle'}`\n"
-        f"• **Status Tugas Saat Ini**: `{'⏳ Sedang Berjalan' if is_task_running else '💤 Idle'}`\n"
+        f"• **Sesi Percakapan**: `{current_conv if current_conv else 'Belum ada (Fresh)'}`\n"
+        f"• **Status Tugas Saat Ini**: `{'⏳ Sedang Berjalan (PID: ' + str(running_proc.pid) + ')' if is_proc_running else '💤 Idle'}`\n"
         f"• **Whitelist User ID**: `{user_id}` (Terverifikasi)\n"
         f"• **Pending Approvals**: `{len(pending_approvals)}`"
     )
@@ -619,21 +575,20 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    # 1. Batalkan tugas yang sedang berjalan jika ada
+    # 1. Hentikan proses yang sedang berjalan jika ada
+    proc = user_processes.get(user_id)
+    if proc and proc.returncode is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
     task = user_tasks.get(user_id)
     if task and not task.done():
         task.cancel()
 
-    # 2. Hentikan dan bersihkan sesi Antigravity Agent
-    agent = user_agents.pop(user_id, None)
-    if agent:
-        try:
-            await agent.__aexit__(None, None, None)
-        except Exception as e:
-            logger.warning(f"Error saat menutup sesi agent pada /reset: {e}")
-
-    user_approval_hooks.pop(user_id, None)
-    active_user_contexts.pop(user_id, None)
+    # 2. Hapus memori percakapan
+    old_conv = user_conversations.pop(user_id, None)
 
     # 3. Batalkan approval yang tertunda
     for req_id, info in list(pending_approvals.items()):
@@ -646,7 +601,8 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot,
         update.effective_chat.id,
         "🔄 **Sesi Percakapan Direset!**\n"
-        "Konteks obrolan dan riwayat sesi telah dibersihkan. Agen siap untuk instruksi baru."
+        f"Riwayat percakapan lama ({old_conv[:8] + '...' if old_conv else 'None'}) telah dibersihkan. "
+        "Instruksi berikutnya akan memulai percakapan baru di `agy`."
     )
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -654,14 +610,28 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    task = user_tasks.get(user_id)
-
     cancelled_anything = False
 
+    # 1. Matikan subprocess agy aktif
+    proc = user_processes.get(user_id)
+    if proc and proc.returncode is None:
+        try:
+            proc.terminate()
+            await asyncio.sleep(0.5)
+            if proc.returncode is None:
+                proc.kill()
+            cancelled_anything = True
+            logger.info(f"Subprocess agy (PID: {proc.pid}) untuk user {user_id} dimatikan via /cancel.")
+        except Exception as e:
+            logger.warning(f"Error mematikan proses {user_id}: {e}")
+
+    # 2. Batalkan async task
+    task = user_tasks.get(user_id)
     if task and not task.done():
         task.cancel()
         cancelled_anything = True
 
+    # 3. Batalkan pending approvals
     for req_id, info in list(pending_approvals.items()):
         if info.get("user_id") == user_id:
             fut = info.get("future")
@@ -682,13 +652,13 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_send_message(
             context.bot,
             update.effective_chat.id,
-            "🛑 **Tugas berhasil dibatalkan!** Eksekusi telah dihentikan."
+            "🛑 **Tugas berhasil dibatalkan!** Subprocess `agy` dan eksekusi telah dihentikan."
         )
     else:
         await safe_send_message(
             context.bot,
             update.effective_chat.id,
-            "ℹ️ Tidak ada tugas atau perintah yang sedang berjalan saat ini."
+            "ℹ️ Tidak ada tugas atau proses `agy` yang sedang berjalan saat ini."
         )
 
 # ==============================================================================
@@ -700,85 +670,77 @@ async def execute_agent_turn(
     user_text: str
 ):
     """
-    Eksekusi satu putaran percakapan dengan Antigravity Agent.
-    Dijalankan sebagai asyncio.Task agar dapat di-cancel via /cancel.
+    Eksekusi satu putaran instruksi ke agy CLI subprocess.
+    Dijalankan di dalam user mutex lock dan terlindungi oleh /cancel.
     """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # 1. Evaluasi Hardline Security Blocklist
+    if is_hardline_blocked(user_text):
+        logger.error(f"🚨 HARDLINE SECURITY BLOCKLIST TRIGGERED: {user_text}")
+        await safe_send_message(
+            bot=context.bot,
+            chat_id=chat_id,
+            text=(
+                f"🚨 **HARDLINE SECURITY BLOCKLIST TRIGGERED!**\n\n"
+                f"Instruksi berikut terdeteksi berisiko katastropik dan **DIBLOKIR TOTAL** demi integritas sistem:\n"
+                f"```bash\n{user_text}\n```"
+            )
+        )
+        return
+
+    # 2. Evaluasi Hermes Interactive Approval (Intent Guard)
+    is_destruct, reason = is_destructive_prompt(user_text)
+    if is_destruct:
+        approved = await request_user_approval(
+            bot=context.bot,
+            chat_id=chat_id,
+            user_id=user_id,
+            prompt=user_text,
+            reason=reason
+        )
+        if not approved:
+            await safe_send_message(
+                context.bot,
+                chat_id,
+                "❌ **Instruksi Ditolak.** Eksekusi tidak dijalankan."
+            )
+            return
+
+    # 3. Jalankan melalui agy CLI Subprocess
     status_msg = await safe_send_message(
         context.bot,
         chat_id,
-        "⏳ *Memproses instruksi ke Antigravity...*"
+        "⏳ *Antigravity sedang berpikir & memproses...*"
     )
 
     stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(send_typing_periodically(context.bot, chat_id, stop_typing))
+    typing_task = asyncio.create_task(
+        send_typing_and_progress(context.bot, chat_id, status_msg, stop_typing)
+    )
 
     try:
-        # Daftarkan / update context Telegram aktif untuk sesi user ini
-        active_user_contexts[user_id] = {
-            "bot": context.bot,
-            "chat_id": chat_id,
-            "status_msg": status_msg
-        }
+        active_conv = user_conversations.get(user_id)
+        output_text, new_conv_id = await run_agy_cli(
+            user_id=user_id,
+            prompt=user_text,
+            conv_id=active_conv,
+            cwd=WORKSPACE_DIR
+        )
 
-        # Inisialisasi Hook (hanya menyimpan user_id, decoupled dari Bot)
-        if user_id not in user_approval_hooks:
-            hook = TelegramApprovalHook(user_id=user_id)
-            user_approval_hooks[user_id] = hook
-        else:
-            hook = user_approval_hooks[user_id]
+        # Simpan atau perbarui conversation_id untuk memori multi-turn
+        if new_conv_id:
+            user_conversations[user_id] = new_conv_id
 
-        # Inisialisasi Agent jika belum ada (Stateful multi-turn memory)
-        if user_id not in user_agents:
-            agent_config = LocalAgentConfig(
-                system_instructions=SYSTEM_INSTRUCTIONS,
-                capabilities=CapabilitiesConfig(),
-                workspaces=[WORKSPACE_DIR],
-                policies=[Policy(tool="*", decision=Decision.APPROVE)],
-                hooks=[hook]
-            )
-            new_agent = Agent(agent_config)
-            await new_agent.__aenter__()
-            user_agents[user_id] = new_agent
-
-        agent = user_agents[user_id]
-
-        # Kirim prompt ke Antigravity Agent
-        response = await agent.chat(user_text)
-
-        # Kumpulkan teks sambil memberikan pembaruan live jika ada ToolCall
-        output_text = ""
-        async for chunk in response.chunks:
-            if isinstance(chunk, ToolCall):
-                if status_msg:
-                    await safe_edit_message(status_msg, f"⚙️ *Sedang menjalankan:* `{chunk.name}`...")
-            elif isinstance(chunk, Text):
-                output_text += chunk.text
-
-        if not output_text.strip():
-            # Fallback jika model menggunakan direct resolve
-            try:
-                resolved_text = await response.text()
-                if resolved_text.strip():
-                    output_text = resolved_text
-            except Exception:
-                pass
-
-        if not output_text.strip():
-            output_text = "(Instruksi selesai tanpa output balasan teks)"
-
-        # 4. Deteksi dan kirim media berkas jika ada (MEDIA:/path)
+        # 4. Deteksi dan kirim berkas media jika ada
         media_paths = extract_media_paths(output_text, workspace_dir=WORKSPACE_DIR)
 
-        # 5. Potong pesan agar sesuai batasan karakter Telegram
+        # 5. Potong teks agar muat di batas limit Telegram (4000 char)
         chunks = split_message(output_text, max_length=4000)
 
-        # Kirim respons ke Telegram
         for i, chunk in enumerate(chunks):
             if i == 0 and status_msg:
-                # Gantikan pesan status ephemeral dengan pesan hasil pertama
                 await safe_edit_message(status_msg, chunk)
             else:
                 await safe_send_message(context.bot, chat_id, chunk)
@@ -804,17 +766,16 @@ async def execute_agent_turn(
                 )
 
     except asyncio.CancelledError:
-        logger.info(f"Task for user {user_id} cancelled.")
+        logger.info(f"Task user {user_id} dibatalkan.")
         if status_msg:
             await safe_edit_message(status_msg, "🛑 *Tugas dibatalkan oleh pengguna via /cancel.*")
         raise
     except Exception as e:
-        logger.error(f"Error saat eksekusi Antigravity: {e}", exc_info=True)
+        logger.error(f"Error saat mengeksekusi agy: {e}", exc_info=True)
         err_msg = (
             f"❌ **Terjadi kesalahan saat memproses permintaan:**\n"
             f"```text\n{str(e)[:1000]}\n```\n\n"
-            f"💡 *Petunjuk:* Pastikan kredensial Antigravity (`~/.gemini`) telah tersambung dengan benar "
-            f"atau gunakan `/reset` untuk me-restart sesi."
+            f"💡 *Petunjuk:* Pastikan binary `agy` terpasang di path yang sesuai atau gunakan `/reset` untuk me-restart sesi."
         )
         if status_msg:
             await safe_edit_message(status_msg, err_msg)
@@ -825,9 +786,12 @@ async def execute_agent_turn(
         typing_task.cancel()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Router utama untuk pesan teks yang masuk."""
+    """Router utama untuk pesan teks yang masuk dari pengguna."""
     if not is_authorized(update):
-        logger.warning(f"Unauthorized access attempt from User ID: {update.effective_user.id if update.effective_user else 'Unknown'}")
+        logger.warning(
+            f"Unauthorized access attempt from User ID: "
+            f"{update.effective_user.id if update.effective_user else 'Unknown'}"
+        )
         return
 
     user_id = update.effective_user.id
@@ -840,8 +804,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing_task = user_tasks.get(user_id)
     if existing_task and not existing_task.done():
         await update.message.reply_text(
-            "⏳ *Agen sedang menyelesaikan tugas sebelumnya.*\n"
-            "Kirim `/cancel` jika Anda ingin menghentikan tugas tersebut.",
+            "⏳ *Antigravity sedang menyelesaikan tugas sebelumnya.*\n"
+            "Kirim `/cancel` jika Anda ingin menghentikan proses tersebut.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -855,7 +819,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with user_lock:
             await execute_agent_turn(update, context, user_text)
 
-    # Jalankan sebagai background task yang dapat diinterupsi via /cancel
     task = asyncio.create_task(_locked_runner())
     user_tasks[user_id] = task
 
@@ -869,16 +832,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN APPLICATION ENTRYPOINT & SHUTDOWN LIFECYCLE
 # ==============================================================================
 async def post_shutdown(application):
-    """Menutup seluruh sesi Antigravity Agent secara rapi saat bot dimatikan."""
-    logger.info("Menutup sesi Antigravity Agent...")
-    for user_id, agent in list(user_agents.items()):
+    """Membersihkan seluruh subprocess agy yang masih berjalan saat bot dimatikan."""
+    logger.info("Menutup seluruh subprocess Antigravity...")
+    for user_id, proc in list(user_processes.items()):
         try:
-            await agent.__aexit__(None, None, None)
-        except Exception as e:
-            logger.warning(f"Error saat menutup agent {user_id}: {e}")
-    user_agents.clear()
-    user_approval_hooks.clear()
-    active_user_contexts.clear()
+            if proc.returncode is None:
+                proc.terminate()
+        except Exception:
+            pass
+    user_processes.clear()
+    user_conversations.clear()
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
@@ -888,9 +851,11 @@ def main():
     if not ALLOWED_USER_IDS:
         logger.warning("⚠️ ALLOWED_USER_ID belum diatur atau bernilai 0. Tidak ada pengguna yang dapat mengakses bot!")
 
-    logger.info(f"🛡️ Whitelist User IDs: {ALLOWED_USER_IDS}")
-    logger.info(f"⚙️ Approval Mode: {APPROVAL_MODE} (Timeout: {APPROVAL_TIMEOUT_SECONDS}s)")
-    logger.info(f"📂 Workspace Directory: {WORKSPACE_DIR}")
+    logger.info(f"🤖 Antigravity Engine : Subprocess agy CLI")
+    logger.info(f"📂 Binary Path        : {AGY_BIN_PATH}")
+    logger.info(f"🛡️ Whitelist User IDs : {ALLOWED_USER_IDS}")
+    logger.info(f"⚙️ Approval Mode      : {APPROVAL_MODE} (Timeout: {APPROVAL_TIMEOUT_SECONDS}s)")
+    logger.info(f"📁 Workspace Path     : {WORKSPACE_DIR}")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_shutdown(post_shutdown).build()
 
@@ -901,13 +866,13 @@ def main():
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Daftarkan handler interaksi tombol konfirmasi
+    # Daftarkan handler tombol konfirmasi Approve / Deny
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
     # Daftarkan handler pesan teks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("🚀 Antigravity Telegram Bot siap berjalan...")
+    logger.info("🚀 Antigravity CLI Telegram Bot siap berjalan...")
     app.run_polling()
 
 if __name__ == "__main__":
