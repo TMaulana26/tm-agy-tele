@@ -1,0 +1,26 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: antigravity-telegram:latest
+    container_name: antigravity_telegram_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Jakarta
+      - PYTHONUNBUFFERED=1
+      - WORKSPACE_DIR=/workspace
+    volumes:
+      # Mount folder kredensial Antigravity host ke container (read-only)
+      # Di VPS Linux: ~/.gemini
+      # Di Windows: ${USERPROFILE}/.gemini (dapat dikonfigurasi via HOST_GEMINI_DIR di .env)
+      - ${HOST_GEMINI_DIR:-~/.gemini}:/root/.gemini:ro
+      # Mount folder workspace kodingan host ke dalam container
+      - .:/workspace
+    # Isolasi resource VPS agar bot stabil di VPS kapasitas 1-2 GB RAM
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
