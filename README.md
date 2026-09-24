@@ -134,41 +134,32 @@ newgrp docker
 
 ---
 
-### Langkah 4: Clone Repositori & Konfigurasi di VPS
+### Langkah 4: Jalankan Deployment Otomatis via `deploy.sh`
+
+Di VPS, Anda **tidak perlu mengedit `.env` secara manual menggunakan `nano`**. Cukup jalankan script `deploy.sh`:
 
 ```bash
 git clone <URL_REPOSITORY> tm-agy-tele
 cd tm-agy-tele
+chmod +x deploy.sh
 
-# Salin template konfigurasi
-cp .env.example .env
-nano .env
+# Opsi A: Set token & user ID langsung via argumen terminal
+./deploy.sh --token "TOKEN_DARI_BOTFATHER" --user "ID_TELEGRAM_ANDA"
+
+# Opsi B: Setup interaktif (script akan menanyakan token & ID langsung di terminal)
+./deploy.sh
+
+# Opsi C: Update deployment tanpa pull ulang Git
+./deploy.sh --no-pull
 ```
 
-Sesuaikan isi `.env`:
-```env
-TELEGRAM_BOT_TOKEN="TOKEN_BOTFATHER_ANDA"
-ALLOWED_USER_ID="ID_TELEGRAM_ANDA"
-APPROVAL_MODE="ask_destructive"
-APPROVAL_TIMEOUT_SECONDS=120
-WORKSPACE_DIR="/workspace"
-HOST_GEMINI_DIR="~/.gemini"
-```
-Simpan dengan `Ctrl + O`, `Enter`, lalu keluar dengan `Ctrl + X`.
-
----
-
-### Langkah 5: Build & Jalankan via Docker Compose
-
-```bash
-# Build dan jalankan container di background
-docker compose up -d --build
-
-# Pantau log secara langsung
-docker compose logs -f
-```
-
-Jika log menampilkan `🚀 Antigravity Telegram Bot siap berjalan...`, bot sudah berhasil terhubung ke Telegram. Tekan `Ctrl + C` untuk menutup tampilan log.
+Script `deploy.sh` akan otomatis:
+1. Memeriksa direktori Git dan izin folder.
+2. Mengambil pembaruan kode (`git pull origin main`).
+3. Membuat & mengisi file `.env` tanpa perlu membuka editor teks `nano`.
+4. Memvalidasi keberadaan folder kredensial `~/.gemini` di host.
+5. Membangun ulang dan menyalakan container Docker (`docker compose up -d --build --force-recreate`).
+6. Memverifikasi status kesehatan bot dan menampilkan instruksi log real-time.
 
 ---
 
