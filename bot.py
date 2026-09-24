@@ -179,6 +179,10 @@ user_approval_hooks: Dict[int, "TelegramApprovalHook"] = {}
 user_locks: Dict[int, asyncio.Lock] = {}
 user_tasks: Dict[int, asyncio.Task] = {}
 
+# Active Telegram Context per user (bot, chat_id, status_msg)
+# Dipisahkan dari instance Hook agar LocalAgentConfig aman di-deepcopy oleh Antigravity
+active_user_contexts: Dict[int, dict] = {}
+
 # Pending approval registry:
 # { request_id: {"future": asyncio.Future, "user_id": int, "message": Message, "text": str} }
 pending_approvals: Dict[str, dict] = {}
@@ -405,38 +409,85 @@ class TelegramApprovalHook(PreToolCallDecideHook):
     """
     Hook bawaan Antigravity yang mencegat eksekusi tool sebelum dijalankan.
     Menerapkan Hardline Blocklist & Interactive Approval langsung ke Telegram.
+    HANYA menyimpan user_id pada instance agar LocalAgentConfig aman di-deepcopy oleh Antigravity.
     """
-    def __init__(self, bot, chat_id: int, user_id: int):
+    def __init__(self, user_id: Optional[int] = None, bot=None, chat_id: Optional[int] = None):
         super().__init__()
-        self.bot = bot
-        self.chat_id = chat_id
-        self.user_id = user_id
-        self.status_msg: Optional[Message] = None
+        # Handle fleksibel jika dipanggil gaya baru (user_id) atau gaya lama (bot, chat_id, user_id)
+        if isinstance(user_id, int):
+            self.user_id = user_id
+            if bot is not None or chat_id is not None:
+                ctx = active_user_contexts.setdefault(user_id, {})
+                if bot is not None:
+                    ctx["bot"] = bot
+                if chat_id is not None:
+                    ctx["chat_id"] = chat_id
+        else:
+            # Gaya lama: arg 0 adalah bot, arg 1 adalah chat_id, arg 2 adalah user_id
+            passed_bot = user_id
+            passed_chat_id = bot
+            passed_user_id = chat_id or 0
+            self.user_id = passed_user_id
+            ctx = active_user_contexts.setdefault(passed_user_id, {})
+            if passed_bot is not None:
+                ctx["bot"] = passed_bot
+            if passed_chat_id is not None:
+                ctx["chat_id"] = passed_chat_id
 
-    def update_context(self, bot, chat_id: int, user_id: int, status_msg: Optional[Message] = None):
-        self.bot = bot
-        self.chat_id = chat_id
-        self.user_id = user_id
-        self.status_msg = status_msg
+    def __deepcopy__(self, memo):
+        # Override eksplisit untuk memastikan LocalAgentConfig dapat di-deepcopy tanpa menyentuh Bot object
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        result.user_id = self.user_id
+        return result
+
+    @property
+    def bot(self):
+        return active_user_contexts.get(self.user_id, {}).get("bot")
+
+    @property
+    def chat_id(self):
+        return active_user_contexts.get(self.user_id, {}).get("chat_id")
+
+    @property
+    def status_msg(self):
+        return active_user_contexts.get(self.user_id, {}).get("status_msg")
+
+    def update_context(self, bot=None, chat_id: Optional[int] = None, user_id: Optional[int] = None, status_msg: Optional[Message] = None):
+        uid = user_id or self.user_id
+        ctx = active_user_contexts.setdefault(uid, {})
+        if bot is not None:
+            ctx["bot"] = bot
+        if chat_id is not None:
+            ctx["chat_id"] = chat_id
+        if status_msg is not None:
+            ctx["status_msg"] = status_msg
 
     async def run(self, context: HookContext, data: ToolCall) -> HookResult:
         tool_name = data.name
         args = data.args or {}
+
+        user_ctx = active_user_contexts.get(self.user_id, {})
+        current_bot = user_ctx.get("bot")
+        current_chat_id = user_ctx.get("chat_id")
+        current_status_msg = user_ctx.get("status_msg")
 
         # 1. Evaluasi Hardline Blocklist jika tool adalah eksekusi perintah terminal
         if tool_name.lower() in ["run_command", "terminal", "execute", "execute_command"]:
             cmd = str(args.get("command", "") or args.get("CommandLine", "") or args.get("cmd", ""))
             if is_hardline_blocked(cmd):
                 logger.error(f"🚨 HARDLINE BLOCKLIST TRIGGERED: {cmd}")
-                await safe_send_message(
-                    bot=self.bot,
-                    chat_id=self.chat_id,
-                    text=(
-                        f"🚨 **HARDLINE SECURITY BLOCKLIST TRIGGERED!**\n\n"
-                        f"Perintah berikut terdeteksi berisiko katastropik dan **DIBLOKIR TOTAL** demi keamanan:\n"
-                        f"```bash\n{cmd}\n```"
+                if current_bot and current_chat_id:
+                    await safe_send_message(
+                        bot=current_bot,
+                        chat_id=current_chat_id,
+                        text=(
+                            f"🚨 **HARDLINE SECURITY BLOCKLIST TRIGGERED!**\n\n"
+                            f"Perintah berikut terdeteksi berisiko katastropik dan **DIBLOKIR TOTAL** demi keamanan:\n"
+                            f"```bash\n{cmd}\n```"
+                        )
                     )
-                )
                 return HookResult(
                     allow=False,
                     message="DIBLOKIR: Perintah melanggar Hardline Security Blocklist dan tidak dapat dijalankan."
@@ -445,22 +496,26 @@ class TelegramApprovalHook(PreToolCallDecideHook):
         # 2. Cek apakah aksi memerlukan persetujuan interaktif (destructive)
         is_destruct, details = is_destructive_action(tool_name, args)
         if not is_destruct:
-            if self.status_msg:
-                await safe_edit_message(self.status_msg, f"⚙️ *Menjalankan tool:* `{tool_name}`...")
+            if current_status_msg:
+                await safe_edit_message(current_status_msg, f"⚙️ *Menjalankan tool:* `{tool_name}`...")
             return HookResult(allow=True)
 
         # 3. Minta persetujuan interaktif ke user Telegram
+        if not current_bot or not current_chat_id:
+            logger.error(f"Telegram context tidak ditemukan untuk user {self.user_id}")
+            return HookResult(allow=False, message="Telegram context tidak ditemukan.")
+
         approved = await request_user_approval(
-            bot=self.bot,
-            chat_id=self.chat_id,
+            bot=current_bot,
+            chat_id=current_chat_id,
             user_id=self.user_id,
             action_name=tool_name,
             action_details=details
         )
 
         if approved:
-            if self.status_msg:
-                await safe_edit_message(self.status_msg, f"⚙️ *Mengeksekusi (Disetujui):* `{tool_name}`...")
+            if current_status_msg:
+                await safe_edit_message(current_status_msg, f"⚙️ *Mengeksekusi (Disetujui):* `{tool_name}`...")
             return HookResult(allow=True)
         else:
             return HookResult(
@@ -578,6 +633,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Error saat menutup sesi agent pada /reset: {e}")
 
     user_approval_hooks.pop(user_id, None)
+    active_user_contexts.pop(user_id, None)
 
     # 3. Batalkan approval yang tertunda
     for req_id, info in list(pending_approvals.items()):
@@ -660,13 +716,19 @@ async def execute_agent_turn(
     typing_task = asyncio.create_task(send_typing_periodically(context.bot, chat_id, stop_typing))
 
     try:
-        # Inisialisasi atau update Approval Hook untuk sesi ini
+        # Daftarkan / update context Telegram aktif untuk sesi user ini
+        active_user_contexts[user_id] = {
+            "bot": context.bot,
+            "chat_id": chat_id,
+            "status_msg": status_msg
+        }
+
+        # Inisialisasi Hook (hanya menyimpan user_id, decoupled dari Bot)
         if user_id not in user_approval_hooks:
-            hook = TelegramApprovalHook(bot=context.bot, chat_id=chat_id, user_id=user_id)
+            hook = TelegramApprovalHook(user_id=user_id)
             user_approval_hooks[user_id] = hook
         else:
             hook = user_approval_hooks[user_id]
-            hook.update_context(bot=context.bot, chat_id=chat_id, user_id=user_id, status_msg=status_msg)
 
         # Inisialisasi Agent jika belum ada (Stateful multi-turn memory)
         if user_id not in user_agents:
@@ -682,7 +744,6 @@ async def execute_agent_turn(
             user_agents[user_id] = new_agent
 
         agent = user_agents[user_id]
-        hook.update_context(bot=context.bot, chat_id=chat_id, user_id=user_id, status_msg=status_msg)
 
         # Kirim prompt ke Antigravity Agent
         response = await agent.chat(user_text)
@@ -817,6 +878,7 @@ async def post_shutdown(application):
             logger.warning(f"Error saat menutup agent {user_id}: {e}")
     user_agents.clear()
     user_approval_hooks.clear()
+    active_user_contexts.clear()
 
 def main():
     if not TELEGRAM_BOT_TOKEN:

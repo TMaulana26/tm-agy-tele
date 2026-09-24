@@ -25,6 +25,7 @@ class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
         bot.pending_approvals.clear()
         bot.user_agents.clear()
         bot.user_approval_hooks.clear()
+        bot.active_user_contexts.clear()
         bot.user_tasks.clear()
         bot.user_locks.clear()
 
@@ -394,6 +395,32 @@ class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
         context = MagicMock()
         result = await hook.run(context, tool_call)
         self.assertTrue(result.allow)
+
+    def test_agent_config_deepcopy_safety(self):
+        """Memastikan LocalAgentConfig dengan hook aman di-copy.deepcopy tanpa TypeError."""
+        import copy
+        mock_bot = AsyncMock()
+        bot.active_user_contexts[111111] = {
+            "bot": mock_bot,
+            "chat_id": 123,
+            "status_msg": None
+        }
+        hook = bot.TelegramApprovalHook(user_id=111111)
+
+        cfg = bot.LocalAgentConfig(
+            system_instructions="test instructions",
+            capabilities=bot.CapabilitiesConfig(),
+            workspaces=["."],
+            policies=[bot.Policy(tool="*", decision=bot.Decision.APPROVE)],
+            hooks=[hook]
+        )
+
+        cloned_cfg = copy.deepcopy(cfg)
+        self.assertIsNotNone(cloned_cfg)
+        self.assertEqual(len(cloned_cfg.hooks), 1)
+        cloned_hook = cloned_cfg.hooks[0]
+        self.assertEqual(cloned_hook.user_id, 111111)
+        self.assertEqual(cloned_hook.bot, mock_bot)
 
 if __name__ == "__main__":
     unittest.main()
