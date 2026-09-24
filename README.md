@@ -25,6 +25,7 @@ Dilengkapi sistem **Interactive Approval (ala Hermes Agent)** untuk meminta konf
   - **Inline Keyboard Confirmation**: Menampilkan tombol `[ ✅ Setujui (Approve) ]` dan `[ ❌ Tolak (Deny) ]` untuk aksi berisiko tinggi.
   - **Fail-Closed Timeout**: Eksekusi dibatalkan otomatis jika tombol tidak ditekan dalam batas waktu (default: 120 detik).
 - 🛑 **Real Process Interruption (`/cancel`)**: Menghentikan proses `agy` yang sedang berjalan di sistem host secara instan (`SIGTERM`/`SIGKILL`).
+- 📊 **Real-Time Quota & Usage Monitor (`/usage` & `/limit`)**: Mengekstrak data kuota akun Antigravity (Gemini, Claude, GPT), visual progress bar, persentase kuota, dan sisa waktu refresh langsung dari `agy` CLI tanpa memakan token LLM.
 - 📁 **Native Media & File Delivery**: Mendeteksi sintaks `MEDIA:/path/ke/file` pada output `agy` dan otomatis mengirimkannya sebagai dokumen Telegram (`send_document`).
 - ⏳ **Live Timer Feedback & Typing**: Indikator pengetikan berkala dan pembaruan timer detik berjalan selama proses berlangsung.
 - ✂️ **Safe Message Chunking & Markdown Fallback**: Pemotongan pesan otomatis di bawah 4000 karakter dengan fallback mulus ke *plain text* jika Markdown invalid.
@@ -112,6 +113,7 @@ Jika Anda ingin menjalankan bot di dalam container Docker:
 | Perintah | Deskripsi |
 | :--- | :--- |
 | `/start` | Memulai interaksi, verifikasi izin, dan panduan ringkas |
+| `/usage` / `/limit` | Menampilkan kuota & sisa limit model (Gemini, Claude, GPT) secara real-time |
 | `/status` | Cek status engine, path binary, workspace, ID sesi aktif, dan PID proses |
 | `/cancel` | Menghentikan paksa subprocess `agy` yang sedang berjalan di VPS |
 | `/reset` | Menghapus memori sesi percakapan aktif dan memulai percakapan baru |

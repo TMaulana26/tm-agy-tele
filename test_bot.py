@@ -464,5 +464,125 @@ docker ps -a
             ws = bot.resolve_workspace_dir()
             self.assertTrue(os.path.isdir(ws))
 
+    # --------------------------------------------------------------------------
+    # 13. MODEL QUOTA & /usage UTILITIES
+    # --------------------------------------------------------------------------
+    def test_format_progress_bar(self):
+        self.assertEqual(bot.format_progress_bar(0.0), "[░░░░░░░░░░] 0.0%")
+        self.assertEqual(bot.format_progress_bar(0.5), "[█████░░░░░] 50.0%")
+        self.assertEqual(bot.format_progress_bar(1.0), "[██████████] 100.0%")
+        self.assertEqual(bot.format_progress_bar(0.944), "[█████████░] 94.4%")
+        self.assertEqual(bot.format_progress_bar(0.785), "[████████░░] 78.5%")
+
+    def test_format_relative_time(self):
+        # Empty string
+        self.assertEqual(bot.format_relative_time(""), "")
+        # Past timestamp
+        self.assertEqual(bot.format_relative_time("2020-01-01T00:00:00Z"), "Quota available")
+        # Future timestamp
+        future_iso = "2099-01-01T00:00:00Z"
+        rel = bot.format_relative_time(future_iso)
+        self.assertTrue(rel.startswith("Refreshes in "))
+
+    def test_format_usage_data_json(self):
+        sample_json = json.dumps({
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "description": "Models within this group: Gemini Flash, Gemini Pro",
+                            "buckets": [
+                                {
+                                    "name": "Weekly Limit Remaining",
+                                    "remaining_fraction": 0.944,
+                                    "reset_time": "2099-01-01T00:00:00Z"
+                                },
+                                {
+                                    "name": "Five Hour Limit Remaining",
+                                    "remaining_fraction": 0.785,
+                                    "reset_time": "2099-01-01T00:00:00Z"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        })
+        formatted = bot.format_usage_data(sample_json)
+        self.assertIn("Models &amp; Quota", formatted)
+        self.assertIn("GEMINI MODELS", formatted)
+        self.assertIn("Weekly Limit Remaining", formatted)
+        self.assertIn("Five Hour Limit Remaining", formatted)
+        self.assertIn("94.4%", formatted)
+        self.assertIn("78.5%", formatted)
+
+    def test_format_usage_data_tsv_fallback(self):
+        tsv_sample = "Gemini Models\tWeekly Limit Remaining\t94%\t2026-09-30T02:23:22Z"
+        formatted = bot.format_usage_data(tsv_sample)
+        self.assertIn("Gemini Models", formatted)
+        self.assertIn("Weekly Limit Remaining", formatted)
+        self.assertIn("94%", formatted)
+
+    def test_is_quota_inquiry(self):
+        # Pertanyaan kuota dalam bahasa alami
+        self.assertTrue(bot.is_quota_inquiry("Usage limit akang sisa berapa ya ?"))
+        self.assertTrue(bot.is_quota_inquiry("sisa limit"))
+        self.assertTrue(bot.is_quota_inquiry("sisa kuota saya berapa ya"))
+        self.assertTrue(bot.is_quota_inquiry("cek kuota"))
+        self.assertTrue(bot.is_quota_inquiry("cek limit"))
+        self.assertTrue(bot.is_quota_inquiry("/usage"))
+        self.assertTrue(bot.is_quota_inquiry("/limit"))
+        self.assertTrue(bot.is_quota_inquiry("berapa kuota tersisa?"))
+
+        # Bukan pertanyaan kuota (instruksi koding atau percakapan biasa)
+        self.assertFalse(bot.is_quota_inquiry("SELECT * FROM users LIMIT 10"))
+        self.assertFalse(bot.is_quota_inquiry("buat middleware rate limit di nodejs"))
+        self.assertFalse(bot.is_quota_inquiry("halo apa kabar"))
+        self.assertFalse(bot.is_quota_inquiry("tolong buatkan form input dengan css"))
+
+    async def test_usage_command_unauthorized(self):
+        update = MagicMock()
+        update.effective_user.id = 999999  # Unauthorized
+        context = MagicMock()
+        await bot.usage_command(update, context)
+        # Should return without sending message
+        context.bot.send_message.assert_not_called()
+
+    async def test_usage_command_authorized(self):
+        update = MagicMock()
+        update.effective_user.id = 111111  # Authorized
+        update.effective_chat.id = 111111
+        context = MagicMock()
+
+        mock_status_msg = AsyncMock()
+        context.bot.send_message = AsyncMock(return_value=mock_status_msg)
+
+        with patch("bot.fetch_agy_usage_report", new=AsyncMock(return_value="📊 <b>Laporan Kuota</b>")):
+            await bot.usage_command(update, context)
+            mock_status_msg.edit_text.assert_called_once()
+            call_kwargs = mock_status_msg.edit_text.call_args.kwargs
+            self.assertIn("Laporan Kuota", call_kwargs.get("text", ""))
+
+    async def test_handle_message_quota_inquiry_intercept(self):
+        update = MagicMock()
+        update.effective_user.id = 111111
+        update.effective_chat.id = 111111
+        update.message.text = "Usage limit akang sisa berapa ya ?"
+        context = MagicMock()
+
+        mock_status_msg = AsyncMock()
+        context.bot.send_message = AsyncMock(return_value=mock_status_msg)
+
+        with patch("bot.fetch_agy_usage_report", new=AsyncMock(return_value="📊 <b>Laporan Kuota Intercepted</b>")):
+            with patch("bot.execute_agent_turn", new=AsyncMock()) as mock_agent_turn:
+                await bot.handle_message(update, context)
+                # execute_agent_turn must NOT be called because it was intercepted
+                mock_agent_turn.assert_not_called()
+                mock_status_msg.edit_text.assert_called_once()
+                call_kwargs = mock_status_msg.edit_text.call_args.kwargs
+                self.assertIn("Laporan Kuota Intercepted", call_kwargs.get("text", ""))
+
 if __name__ == "__main__":
     unittest.main()
