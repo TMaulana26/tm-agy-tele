@@ -422,5 +422,47 @@ class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fut.done())
         self.assertTrue(fut.result())
 
+    # --------------------------------------------------------------------------
+    # 11. MARKDOWN TO TELEGRAM HTML CONVERTER
+    # --------------------------------------------------------------------------
+    def test_markdown_to_telegram_html_conversion(self):
+        sample = """### 1. **Uptime & Beban CPU**
+* **Uptime:** 26 hari
+* **Load:** `0.10, 0.20` *(Sangat stabil)*
+* **`stretch_reminder`**: Aktif (Up 7 hari)
+> Catatan server
+```bash
+docker ps -a
+```"""
+        html_out = bot.markdown_to_telegram_html(sample)
+        # Verify headers converted without ###
+        self.assertNotIn("###", html_out)
+        self.assertIn("<b>1. Uptime &amp; Beban CPU</b>", html_out)
+        # Verify bullets
+        self.assertIn("• <b>Uptime:</b>", html_out)
+        # Verify inline code with underscore safely preserved
+        self.assertIn("<code>stretch_reminder</code>", html_out)
+        self.assertIn("<code>0.10, 0.20</code>", html_out)
+        # Verify italic
+        self.assertIn("<i>(Sangat stabil)</i>", html_out)
+        # Verify blockquote
+        self.assertIn("<blockquote>Catatan server</blockquote>", html_out)
+        # Verify code block
+        self.assertIn('<pre><code class="language-bash">docker ps -a</code></pre>', html_out)
+
+    # --------------------------------------------------------------------------
+    # 12. WORKSPACE DIRECTORY AUTO-FALLBACK
+    # --------------------------------------------------------------------------
+    def test_resolve_workspace_dir(self):
+        # When valid directory
+        with patch.dict(os.environ, {"WORKSPACE_DIR": "."}):
+            ws = bot.resolve_workspace_dir()
+            self.assertEqual(ws, ".")
+
+        # When invalid directory like /workspace (Docker leftover)
+        with patch.dict(os.environ, {"WORKSPACE_DIR": "/non_existent_workspace_path_123"}):
+            ws = bot.resolve_workspace_dir()
+            self.assertTrue(os.path.isdir(ws))
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ import re
 import json
 import time
 import uuid
+import html
 import shutil
 import asyncio
 import logging
@@ -74,7 +75,32 @@ AGY_BIN_PATH = os.getenv(
     shutil.which("agy") or shutil.which("agy.exe") or "/home/ubuntu/.local/bin/agy"
 ).strip()
 
-WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "/home/ubuntu").strip()
+def resolve_workspace_dir() -> str:
+    """
+    Memvalidasi dan mengembalikan path direktori kerja (workspace) yang valid.
+    Jika WORKSPACE_DIR di .env tidak valid atau menunjuk ke folder yang tidak ada
+    (misalnya peninggalan '/workspace' Docker), otomatis menggunakan fallback direktori home.
+    """
+    raw = os.getenv("WORKSPACE_DIR", "").strip()
+    if raw and os.path.exists(raw) and os.path.isdir(raw):
+        return raw
+
+    # Fallback 1: Jika di Linux VPS host dan /home/ubuntu ada
+    if os.path.isdir("/home/ubuntu"):
+        if raw and raw != "/home/ubuntu":
+            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan fallback: /home/ubuntu")
+        return "/home/ubuntu"
+
+    # Fallback 2: Direktori home pengguna saat ini
+    home = Path.home()
+    if home.is_dir():
+        if raw and raw != str(home):
+            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan fallback home: {home}")
+        return str(home)
+
+    return os.getcwd()
+
+WORKSPACE_DIR = resolve_workspace_dir()
 APPROVAL_MODE = os.getenv("APPROVAL_MODE", "ask_destructive").strip().lower()
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120"))
 
@@ -188,15 +214,85 @@ def split_message(text: str, max_length: int = 4000) -> List[str]:
         text = text[split_idx:].lstrip("\r\n")
     return chunks
 
+def markdown_to_telegram_html(text: str) -> str:
+    """
+    Mengonversi output Markdown dari AI ke format Telegram HTML yang valid dan rapi.
+    Sangat tahan banting terhadap underscore (seperti nama container Docker),
+    karakter khusus, regex, dan format heading.
+    """
+    if not text:
+        return ""
+
+    # 1. Simpan code blocks (```...```) agar isinya tidak terpengaruh format lain
+    code_blocks = []
+    def save_code_block(match):
+        lang = (match.group(1) or "").strip()
+        code = match.group(2)
+        idx = len(code_blocks)
+        escaped_code = html.escape(code.strip("\r\n"))
+        if lang:
+            replacement = f'<pre><code class="language-{html.escape(lang)}">{escaped_code}</code></pre>'
+        else:
+            replacement = f"<pre><code>{escaped_code}</code></pre>"
+        code_blocks.append(replacement)
+        return f"\x00CODEBLOCK{idx}\x00"
+
+    text = re.sub(r"```([a-zA-Z0-9_\+\-]*)?\n([\s\S]*?)```", save_code_block, text)
+
+    # 2. Simpan inline code (`...`)
+    inline_codes = []
+    def save_inline_code(match):
+        code = match.group(1)
+        idx = len(inline_codes)
+        escaped_code = html.escape(code)
+        inline_codes.append(f"<code>{escaped_code}</code>")
+        return f"\x00INLINECODE{idx}\x00"
+
+    text = re.sub(r"`([^`\n]+)`", save_inline_code, text)
+
+    # 3. Escape HTML pada sisa teks biasa (&, <, >)
+    text = html.escape(text)
+
+    # 4. Format headers (###, ##, #) menjadi bold tanpa tanda pagar dan tanpa double **
+    def format_header(match):
+        content = match.group(1).strip()
+        clean_content = re.sub(r"\*\*(.*?)\*\*", r"\1", content)
+        return f"<b>{clean_content}</b>"
+
+    text = re.sub(r"(?m)^#{1,6}\s*(.*?)$", format_header, text)
+
+    # 5. Format bullet points (* atau - di awal baris) menjadi simbol bullet rapi (• )
+    text = re.sub(r"(?m)^[\*\-]\s+", r"• ", text)
+
+    # 6. Format bold (**text** atau __text__) -> <b>text</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+
+    # 7. Format italic (*text* atau _text_)
+    text = re.sub(r"(?<!\w)\*([^\*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", text)
+
+    # 8. Format blockquote (> text) -> <blockquote>text</blockquote>
+    text = re.sub(r"(?m)^&gt;\s*(.*?)$", r"<blockquote>\1</blockquote>", text)
+
+    # 9. Kembalikan inline codes dan code blocks
+    for idx, replacement in enumerate(inline_codes):
+        text = text.replace(f"\x00INLINECODE{idx}\x00", replacement)
+
+    for idx, replacement in enumerate(code_blocks):
+        text = text.replace(f"\x00CODEBLOCK{idx}\x00", replacement)
+
+    return text
+
 async def safe_send_message(
     bot,
     chat_id: int,
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = ParseMode.MARKDOWN
+    parse_mode: Optional[str] = ParseMode.HTML
 ) -> Optional[Message]:
     """
-    Mengirim pesan Telegram dengan fallback otomatis ke teks polos jika parsing markdown gagal.
+    Mengirim pesan Telegram dengan fallback otomatis ke teks polos jika parsing HTML/Markdown gagal.
     """
     try:
         return await bot.send_message(
@@ -206,7 +302,7 @@ async def safe_send_message(
             parse_mode=parse_mode
         )
     except BadRequest as e:
-        logger.warning(f"Markdown parse error saat send_message ({e}). Mengirim ulang sebagai plain text.")
+        logger.warning(f"Formatting parse error saat send_message ({e}). Mengirim ulang sebagai plain text.")
         try:
             return await bot.send_message(
                 chat_id=chat_id,
@@ -225,10 +321,10 @@ async def safe_edit_message(
     msg: Message,
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = ParseMode.MARKDOWN
+    parse_mode: Optional[str] = ParseMode.HTML
 ) -> bool:
     """
-    Mengedit pesan Telegram dengan fallback otomatis ke plain text jika markdown invalid.
+    Mengedit pesan Telegram dengan fallback otomatis ke plain text jika formatting invalid.
     """
     try:
         await msg.edit_text(
@@ -241,7 +337,7 @@ async def safe_edit_message(
         err_msg = str(e).lower()
         if "not modified" in err_msg:
             return True
-        logger.warning(f"Markdown parse error saat edit_message ({e}). Mengedit ulang sebagai plain text.")
+        logger.warning(f"Formatting parse error saat edit_message ({e}). Mengedit ulang sebagai plain text.")
         try:
             await msg.edit_text(
                 text=text,
@@ -736,14 +832,17 @@ async def execute_agent_turn(
         # 4. Deteksi dan kirim berkas media jika ada
         media_paths = extract_media_paths(output_text, workspace_dir=WORKSPACE_DIR)
 
-        # 5. Potong teks agar muat di batas limit Telegram (4000 char)
-        chunks = split_message(output_text, max_length=4000)
+        # 5. Format teks output menggunakan konverter Telegram HTML yang rapi & aman
+        formatted_html = markdown_to_telegram_html(output_text)
+
+        # 6. Potong teks agar muat di batas limit Telegram (4000 char)
+        chunks = split_message(formatted_html, max_length=4000)
 
         for i, chunk in enumerate(chunks):
             if i == 0 and status_msg:
-                await safe_edit_message(status_msg, chunk)
+                await safe_edit_message(status_msg, chunk, parse_mode=ParseMode.HTML)
             else:
-                await safe_send_message(context.bot, chat_id, chunk)
+                await safe_send_message(context.bot, chat_id, chunk, parse_mode=ParseMode.HTML)
 
         # Kirim file media yang terdeteksi
         for file_path in media_paths:

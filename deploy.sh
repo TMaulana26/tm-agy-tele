@@ -163,6 +163,18 @@ if [ -z "$CURRENT_AGY_PATH" ]; then
     CURRENT_AGY_PATH="$DETECTED_AGY"
 fi
 
+# Auto-detect & auto-correct WORKSPACE_DIR if invalid or still /workspace from Docker
+CURRENT_WORKSPACE=$(grep -E "^WORKSPACE_DIR=" "$SCRIPT_DIR/.env" | cut -d '=' -f2- | tr -d '"' | tr -d "'" || echo "")
+if [ "$DEPLOY_MODE" = "systemd" ] && { [ "$CURRENT_WORKSPACE" = "/workspace" ] || [ -z "$CURRENT_WORKSPACE" ] || [ ! -d "$CURRENT_WORKSPACE" ]; }; then
+    TARGET_WS="/home/ubuntu"
+    if [ ! -d "$TARGET_WS" ]; then
+        TARGET_WS="$HOME"
+    fi
+    echo -e "${YELLOW}⚠️  WORKSPACE_DIR bernilai '${CURRENT_WORKSPACE}' yang tidak ada di host VPS.${NC}"
+    echo -e "${GREEN}   Mengoreksi otomatis WORKSPACE_DIR ke: ${TARGET_WS}${NC}"
+    update_env_var "WORKSPACE_DIR" "$TARGET_WS"
+fi
+
 PLACEHOLDER_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
 PLACEHOLDER_USER="7163641352"
 
