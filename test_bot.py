@@ -1017,6 +1017,84 @@ docker ps -a
         # Should not be converted to <i>test</i> inside table pre block
         self.assertNotIn("<i>", out)
 
+    def test_markdown_to_telegram_html_crlf_tables(self):
+        crlf_md = "| Col 1 | Col 2 |\r\n| --- | --- |\r\n| Val 1 | Val 2 |\r\n"
+        out = bot.markdown_to_telegram_html(crlf_md)
+        self.assertIn("<pre><code>| Col 1 | Col 2 |\n| --- | --- |\n| Val 1 | Val 2 |</code></pre>", out)
+
+    def test_markdown_to_telegram_html_table_empty_cells(self):
+        empty_cell_md = "| A | B |\n|---|---|\n|| 25 |\n| 10 ||\n|||\n"
+        out = bot.markdown_to_telegram_html(empty_cell_md)
+        self.assertIn("<pre><code>| A | B |\n|---|---|\n|| 25 |\n| 10 ||\n|||</code></pre>", out)
+
+    def test_markdown_to_telegram_html_table_empty_header_cell(self):
+        empty_header_md = "|| Header 2 |\n|---|---|\n| 1 | 2 |\n"
+        out = bot.markdown_to_telegram_html(empty_header_md)
+        self.assertIn("<pre><code>|| Header 2 |\n|---|---|\n| 1 | 2 |</code></pre>", out)
+
+    async def test_safe_send_message_reply_deleted_preserves_formatting(self):
+        mock_bot = AsyncMock()
+        mock_msg = MagicMock(message_id=202)
+        mock_bot.send_message.side_effect = [
+            bot.BadRequest("Message to be replied not found"),
+            mock_msg
+        ]
+
+        res = await bot.safe_send_message(
+            bot=mock_bot,
+            chat_id=123,
+            text="<b>Pesan HTML</b>",
+            reply_to_message_id=999
+        )
+        self.assertEqual(res, mock_msg)
+        self.assertEqual(mock_bot.send_message.call_count, 2)
+        second_kwargs = mock_bot.send_message.call_args_list[1].kwargs
+        self.assertEqual(second_kwargs.get("parse_mode"), bot.ParseMode.HTML)
+        self.assertNotIn("reply_to_message_id", second_kwargs)
+
+    async def test_handle_document_message_windows_reserved_chars_sanitized(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                update = MagicMock()
+                update.effective_user.id = 111111
+                update.message.caption = None
+                mock_doc = MagicMock()
+                mock_doc.file_name = "report:final*v1?.pdf"  # Windows illegal chars
+                mock_file = AsyncMock()
+                mock_doc.get_file = AsyncMock(return_value=mock_file)
+                update.message.document = mock_doc
+
+                context = MagicMock()
+                with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+                    await bot.handle_document_message(update, context)
+                    mock_dispatch.assert_called_once()
+                    dest_call_arg = str(mock_file.download_to_drive.call_args.kwargs.get("custom_path"))
+                    self.assertNotIn(":", Path(dest_call_arg).name)
+                    self.assertNotIn("*", dest_call_arg)
+                    self.assertNotIn("?", dest_call_arg)
+                    self.assertTrue(dest_call_arg.endswith("report_final_v1_.pdf"))
+
+    async def test_execute_agent_turn_status_edit_failure_fallback_send(self):
+        update = MagicMock()
+        update.effective_user.id = 111111
+        update.effective_chat.id = 123
+        update.message.message_id = 777
+
+        context = MagicMock()
+        mock_status_msg = AsyncMock()
+        mock_status_msg.message_id = 888
+
+        with patch("bot.safe_send_message", new=AsyncMock(return_value=mock_status_msg)) as mock_send:
+            with patch("bot.run_agy_cli", new=AsyncMock(return_value=("Hasil respons", "conv-turn-1"))):
+                with patch("bot.safe_edit_message", new=AsyncMock(return_value=False)):
+                    await bot.execute_agent_turn(update, context, "halo bot")
+                    self.assertEqual(mock_send.call_count, 2)
+                    second_call = mock_send.call_args_list[1]
+                    self.assertEqual(second_call.kwargs.get("reply_to_message_id"), 777)
+                    call_text = second_call.args[2] if len(second_call.args) > 2 else second_call.kwargs.get("text", "")
+                    self.assertIn("Hasil respons", call_text)
+
 if __name__ == "__main__":
     unittest.main()
 

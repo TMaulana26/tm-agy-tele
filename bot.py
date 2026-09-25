@@ -256,6 +256,9 @@ def markdown_to_telegram_html(text: str) -> str:
     if not text:
         return ""
 
+    # Normalisasi line endings (CRLF -> LF) agar regex multiline konsisten di semua OS
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
     # 1. Simpan code blocks (```...```) agar isinya tidak terpengaruh format lain
     code_blocks = []
     def save_code_block(match):
@@ -274,9 +277,9 @@ def markdown_to_telegram_html(text: str) -> str:
 
     # 2. Simpan GFM pipe tables agar rapi & monospace di mobile Telegram (<pre><code>...</code></pre>)
     table_pattern = re.compile(
-        r"(?m)^([ \t]*\|?[^\n|]+\|[^\n]*\n"
-        r"[ \t]*\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*:?-+:?[ \t]*\|?[ \t]*(?:\n|$))"
-        r"((?:[ \t]*\|?[^\n|]+\|[^\n]*(?:\n|$))*)"
+        r"(?m)^([ \t]*\|?[^\n]*\|[^\n]*\n"
+        r"[ \t]*\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*:?-+:?[ \t]*\|?[ \t]*(?:\n|\Z))"
+        r"((?:[ \t]*\|?[^\n]*\|[^\n]*(?:\n|\Z))*)"
     )
 
     def save_markdown_table(match):
@@ -359,10 +362,30 @@ async def safe_send_message(
             reply_to_message_id=reply_to_message_id
         )
     except BadRequest as e:
-        logger.warning(f"Error saat send_message ({e}). Mengirim ulang sebagai plain text...")
+        err_str = str(e).lower()
         effective_reply_to = reply_to_message_id
-        if "repl" in str(e).lower():
-            effective_reply_to = None
+
+        # 1. Jika error karena reply target tidak ditemukan/dihapus, coba kirim ulang dengan formatting utuh
+        if "repl" in err_str and effective_reply_to is not None:
+            logger.warning(f"Reply target {effective_reply_to} tidak valid ({e}). Mengirim ulang tanpa reply_to...")
+            try:
+                return await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                    disable_notification=disable_notification
+                )
+            except BadRequest as e_retry:
+                e = e_retry
+                err_str = str(e).lower()
+            except Exception as e_retry:
+                logger.error(f"Gagal mengirim ulang pesan: {e_retry}")
+                return None
+
+        # 2. Fallback ke teks polos jika formatting invalid atau pengiriman sebelumnya gagal
+        logger.warning(f"Error saat send_message ({e}). Mengirim ulang sebagai plain text...")
+        target_reply = effective_reply_to if "repl" not in err_str else None
         try:
             return await bot.send_message(
                 chat_id=chat_id,
@@ -370,11 +393,11 @@ async def safe_send_message(
                 reply_markup=reply_markup,
                 parse_mode=None,
                 disable_notification=disable_notification,
-                reply_to_message_id=effective_reply_to
+                reply_to_message_id=target_reply
             )
         except BadRequest as e2:
-            if "repl" in str(e2).lower() and effective_reply_to is not None:
-                # Jika pesan yang di-reply sudah dihapus pengguna, coba kirim tanpa reply_to_message_id
+            if "repl" in str(e2).lower() and target_reply is not None:
+                # Jika pesan yang di-reply sudah dihapus pengguna saat retry plain text
                 try:
                     return await bot.send_message(
                         chat_id=chat_id,
@@ -1349,7 +1372,15 @@ async def execute_agent_turn(
 
         for i, chunk in enumerate(chunks):
             if i == 0 and status_msg:
-                await safe_edit_message(status_msg, chunk, parse_mode=ParseMode.HTML)
+                edited = await safe_edit_message(status_msg, chunk, parse_mode=ParseMode.HTML)
+                if not edited:
+                    await safe_send_message(
+                        context.bot,
+                        chat_id,
+                        chunk,
+                        parse_mode=ParseMode.HTML,
+                        reply_to_message_id=reply_id
+                    )
             else:
                 await safe_send_message(
                     context.bot,
@@ -1381,8 +1412,11 @@ async def execute_agent_turn(
 
     except asyncio.CancelledError:
         logger.info(f"Task user {user_id} dibatalkan.")
+        cancel_text = "🛑 *Tugas dibatalkan oleh pengguna via /cancel.*"
         if status_msg:
-            await safe_edit_message(status_msg, "🛑 *Tugas dibatalkan oleh pengguna via /cancel.*")
+            edited = await safe_edit_message(status_msg, cancel_text)
+            if not edited:
+                await safe_send_message(context.bot, chat_id, cancel_text, reply_to_message_id=reply_id)
         raise
     except Exception as e:
         logger.error(f"Error saat mengeksekusi agy: {e}", exc_info=True)
@@ -1392,7 +1426,9 @@ async def execute_agent_turn(
             f"💡 *Petunjuk:* Pastikan binary `agy` terpasang di path yang sesuai atau gunakan `/reset` untuk me-restart sesi."
         )
         if status_msg:
-            await safe_edit_message(status_msg, err_msg)
+            edited = await safe_edit_message(status_msg, err_msg)
+            if not edited:
+                await safe_send_message(context.bot, chat_id, err_msg, reply_to_message_id=reply_id)
         else:
             await safe_send_message(context.bot, chat_id, err_msg, reply_to_message_id=reply_id)
     finally:
@@ -1467,7 +1503,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.error(f"Gagal mengunduh foto untuk user {user_id}: {e}", exc_info=True)
         if update.message:
-            await update.message.reply_text(f"❌ Gagal mengunduh foto: {e}")
+            try:
+                await update.message.reply_text(f"❌ Gagal mengunduh foto: {e}")
+            except Exception:
+                await safe_send_message(context.bot, update.effective_chat.id, f"❌ Gagal mengunduh foto: {e}")
         return
 
     caption = (update.message.caption or "").strip()
@@ -1501,8 +1540,9 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     try:
         file_obj = await doc.get_file()
         orig_name = doc.file_name or f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        safe_name = Path(orig_name).name
-        if not safe_name:
+        clean_name = re.sub(r'[\/:*?"<>|\x00-\x1f]', '_', Path(orig_name).name).strip()
+        safe_name = clean_name
+        if not safe_name.strip("._"):
             safe_name = f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
 
         prefix = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_"
@@ -1514,7 +1554,10 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Gagal mengunduh dokumen untuk user {user_id}: {e}", exc_info=True)
         if update.message:
-            await update.message.reply_text(f"❌ Gagal mengunduh dokumen: {e}")
+            try:
+                await update.message.reply_text(f"❌ Gagal mengunduh dokumen: {e}")
+            except Exception:
+                await safe_send_message(context.bot, update.effective_chat.id, f"❌ Gagal mengunduh dokumen: {e}")
         return
 
     caption = (update.message.caption or "").strip()
