@@ -1154,6 +1154,72 @@ docker ps -a
                 self.assertIn("Tugas selesai diproses.", final_text)
                 self.assertIn("⏱️ <i>Respons dalam", final_text)
 
+    def test_markdown_to_telegram_html_nested_backticks_in_file_links(self):
+        # Memastikan link dengan backtick di labelnya tidak bocor menjadi INLINECODE
+        sample = (
+            "4. Unit Test:\n"
+            "- Tambahan rangkaian unit test di [`test_bot.py`](file:///home/ubuntu/tm-agy-tele/test_bot.py) untuk testing.\n"
+            "- Lihat juga [`bot.py`](https://github.com/org/repo/bot.py) untuk implementasi."
+        )
+        converted = bot.markdown_to_telegram_html(sample)
+        self.assertIn("<code>test_bot.py</code>", converted)
+        self.assertIn('<a href="https://github.com/org/repo/bot.py"><code>bot.py</code></a>', converted)
+        self.assertNotIn("INLINECODE", converted)
+        self.assertNotIn("\x00", converted)
+
+    def test_markdown_to_telegram_html_raw_code_tags(self):
+        # Memastikan tag <code> mentah tetap diformat sebagai bubble code Telegram
+        sample = "Tautan lokal diformat aman menjadi inline code <code>nama_file</code> agar aman."
+        converted = bot.markdown_to_telegram_html(sample)
+        self.assertIn("<code>nama_file</code>", converted)
+        self.assertNotIn("&lt;code&gt;", converted)
+
+    def test_markdown_to_telegram_html_indented_bullets(self):
+        # Memastikan sub-bullet ber-indentasi spasi/tab berubah menjadi simbol bullet
+        sample = (
+            "1. Pengiriman Pesan Baru:\n"
+            "   - Pesan status tunggu sementara dihapus.\n"
+            "\t* Sub-poin dengan tabulasi."
+        )
+        converted = bot.markdown_to_telegram_html(sample)
+        self.assertIn("   • Pesan status tunggu sementara dihapus.", converted)
+        self.assertIn("\t• Sub-poin dengan tabulasi.", converted)
+        self.assertNotIn("   - ", converted)
+
+    def test_markdown_to_telegram_html_horizontal_dividers(self):
+        # Memastikan divider horizontal Markdown diubah menjadi garis rapi
+        sample = "Header\n\n---\n\nKonten\n\n***\n\nFooter"
+        converted = bot.markdown_to_telegram_html(sample)
+        self.assertIn("───────────────", converted)
+        self.assertNotIn("---", converted)
+        self.assertNotIn("***", converted)
+
+    async def test_execute_agent_turn_duration_badge_when_body_mentions_timer(self):
+        # Memastikan badge durasi tetap disematkan di akhir meskipun isi body menyebut emoji timer
+        update = MagicMock()
+        update.effective_user.id = 111111
+        update.effective_chat.id = 123
+        update.message.message_id = 777
+
+        context = MagicMock()
+        mock_status_msg = AsyncMock()
+
+        body_with_timer_mention = (
+            "2. Badge Durasi Pengerjaan:\n"
+            "- Ditambahkan badge durasi respons otomatis di akhir pesan (misal: ⏱️ Respons dalam 4.2d) jika belum tersemat.\n"
+            "Selesai."
+        )
+
+        with patch("bot.safe_send_message", new=AsyncMock(return_value=mock_status_msg)) as mock_send:
+            with patch("bot.run_agy_cli", new=AsyncMock(return_value=(body_with_timer_mention, "conv-timer-mention"))):
+                await bot.execute_agent_turn(update, context, "cek status")
+
+                self.assertEqual(mock_send.call_count, 2)
+                final_call = mock_send.call_args_list[1]
+                final_text = final_call.args[2] if len(final_call.args) > 2 else final_call.kwargs.get("text", "")
+                self.assertTrue(final_text.endswith("</i>"))
+                self.assertIn("⏱️ <i>Respons dalam", final_text)
+
 if __name__ == "__main__":
     unittest.main()
 

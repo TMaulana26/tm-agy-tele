@@ -294,8 +294,38 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = table_pattern.sub(save_markdown_table, text)
 
-    # 3. Simpan inline code (`...`)
     inline_codes = []
+
+    # 3. Simpan link file:/// lokal SEBELUM inline code agar nested backtick [`file`](file:///...) tidak konflik
+    def clean_file_link(match):
+        raw_label = match.group(1).strip()
+        label = raw_label.strip("`").strip()
+        idx = len(inline_codes)
+        escaped_label = html.escape(label)
+        inline_codes.append(f"<code>{escaped_label}</code>")
+        return f"\x00INLINECODE{idx}\x00"
+
+    text = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", clean_file_link, text)
+
+    # 4. Simpan tautan web standar [label](https://...) SEBELUM inline code
+    def save_web_link(match):
+        raw_label = match.group(1).strip()
+        has_code = raw_label.startswith("`") and raw_label.endswith("`")
+        label = raw_label.strip("`").strip()
+        url = match.group(2).strip()
+        idx = len(inline_codes)
+        escaped_label = html.escape(label)
+        escaped_url = html.escape(url, quote=True)
+        if has_code:
+            replacement = f'<a href="{escaped_url}"><code>{escaped_label}</code></a>'
+        else:
+            replacement = f'<a href="{escaped_url}">{escaped_label}</a>'
+        inline_codes.append(replacement)
+        return f"\x00INLINECODE{idx}\x00"
+
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", save_web_link, text)
+
+    # 5. Simpan inline code standar (`...`)
     def save_inline_code(match):
         code = match.group(1)
         idx = len(inline_codes)
@@ -305,32 +335,20 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"`([^`\n]+)`", save_inline_code, text)
 
-    # 4. Simpan link file:/// lokal sebagai inline code (karena tidak dapat dibuka di Telegram client)
-    def clean_file_link(match):
-        label = match.group(1).strip()
+    # 6. Tangkap tag <code>...</code> mentah yang ditulis langsung tanpa backtick
+    def preserve_raw_code_tag(match):
+        content = match.group(1)
         idx = len(inline_codes)
-        escaped_label = html.escape(label)
-        inline_codes.append(f"<code>{escaped_label}</code>")
+        escaped_content = html.escape(content)
+        inline_codes.append(f"<code>{escaped_content}</code>")
         return f"\x00INLINECODE{idx}\x00"
 
-    text = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", clean_file_link, text)
+    text = re.sub(r"<code>([\s\S]*?)</code>", preserve_raw_code_tag, text, flags=re.IGNORECASE)
 
-    # 5. Simpan tautan web standar [label](https://...) -> <a href="...">label</a>
-    def save_web_link(match):
-        label = match.group(1).strip()
-        url = match.group(2).strip()
-        idx = len(inline_codes)
-        escaped_label = html.escape(label)
-        escaped_url = html.escape(url, quote=True)
-        inline_codes.append(f'<a href="{escaped_url}">{escaped_label}</a>')
-        return f"\x00INLINECODE{idx}\x00"
-
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", save_web_link, text)
-
-    # 6. Escape HTML pada sisa teks biasa (&, <, >)
+    # 7. Escape HTML pada sisa teks biasa (&, <, >)
     text = html.escape(text)
 
-    # 7. Format headers (###, ##, #) menjadi bold tanpa tanda pagar dan tanpa double **
+    # 8. Format headers (###, ##, #) menjadi bold tanpa tanda pagar dan tanpa double **
     def format_header(match):
         content = match.group(1).strip()
         clean_content = re.sub(r"\*\*(.*?)\*\*", r"\1", content)
@@ -338,18 +356,21 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"(?m)^#{1,6}\s*(.*?)$", format_header, text)
 
-    # 8. Format bullet points (* atau - di awal baris) menjadi simbol bullet rapi (• )
-    text = re.sub(r"(?m)^[\*\-]\s+", r"• ", text)
+    # 9. Format garis pembatas horizontal (---, ***, ___) menjadi garis tipis elegan Telegram
+    text = re.sub(r"(?m)^[ \t]*([*\-_~]){3,}[ \t]*$", r"───────────────", text)
 
-    # 9. Format bold (**text** atau __text__) -> <b>text</b>
+    # 10. Format bullet points (* atau - di awal baris, termasuk ber-indentasi spasi/tab) menjadi simbol bullet rapi (• )
+    text = re.sub(r"(?m)^([ \t]*)[\*\-]\s+", r"\1• ", text)
+
+    # 11. Format bold (**text** atau __text__) -> <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
 
-    # 10. Format italic (*text* atau _text_)
+    # 12. Format italic (*text* atau _text_)
     text = re.sub(r"(?<!\w)\*([^\*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", text)
 
-    # 11. Format blockquote berturut-turut (> text) menjadi satu <blockquote>...</blockquote>
+    # 13. Format blockquote berturut-turut (> text) menjadi satu <blockquote>...</blockquote>
     def format_contiguous_blockquotes(match):
         block = match.group(0)
         lines = []
@@ -375,12 +396,24 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"(?m)(?:^&gt;.*$\n?)+", format_contiguous_blockquotes, text)
 
-    # 12. Kembalikan inline codes dan code blocks
-    for idx, replacement in enumerate(inline_codes):
-        text = text.replace(f"\x00INLINECODE{idx}\x00", replacement)
+    # 14. Kembalikan inline codes dan code blocks secara multi-pass agar tidak ada marker tersisa
+    for _ in range(5):
+        replaced = False
+        for idx, replacement in enumerate(inline_codes):
+            marker = f"\x00INLINECODE{idx}\x00"
+            if marker in text:
+                text = text.replace(marker, replacement)
+                replaced = True
+        for idx, replacement in enumerate(code_blocks):
+            marker = f"\x00CODEBLOCK{idx}\x00"
+            if marker in text:
+                text = text.replace(marker, replacement)
+                replaced = True
+        if not replaced:
+            break
 
-    for idx, replacement in enumerate(code_blocks):
-        text = text.replace(f"\x00CODEBLOCK{idx}\x00", replacement)
+    # Sanitasi darurat: jika masih ada placeholder yang bocor karena alasan anomali, bersihkan
+    text = re.sub(r"\x00?(?:INLINECODE|CODEBLOCK)\d+\x00?", "", text)
 
     return text.strip()
 
@@ -1416,8 +1449,11 @@ async def execute_agent_turn(
         # 5. Format teks output menggunakan konverter Telegram HTML yang rapi & aman
         formatted_html = markdown_to_telegram_html(output_text)
 
-        # Tambahkan badge durasi pengerjaan jika belum ada di dalam output
-        if "⏱️" not in formatted_html and "durasi pengerjaan" not in formatted_html.lower():
+        # Tambahkan badge durasi pengerjaan jika belum ada di baris terakhir output
+        non_empty_lines = [l.strip() for l in formatted_html.splitlines() if l.strip()]
+        last_line = non_empty_lines[-1].lower() if non_empty_lines else ""
+        has_footer = bool(re.search(r"^⏱️.*(?:respons dalam|waktu respons|durasi pengerjaan)", last_line))
+        if not has_footer:
             formatted_html = f"{formatted_html.rstrip()}\n\n⏱️ <i>Respons dalam {duration_str}</i>"
 
         # 6. Potong teks agar muat di batas limit Telegram (4000 char)
