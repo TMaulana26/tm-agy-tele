@@ -35,6 +35,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    BotCommand,
 )
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
@@ -102,6 +103,15 @@ def resolve_workspace_dir() -> str:
     return os.getcwd()
 
 WORKSPACE_DIR = resolve_workspace_dir()
+
+def get_upload_dir() -> Path:
+    """
+    Memastikan dan mengembalikan direktori penyimpanan berkas unggahan Telegram (.telegram_uploads).
+    """
+    upload_dir = Path(WORKSPACE_DIR) / ".telegram_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    return upload_dir
+
 APPROVAL_MODE = os.getenv("APPROVAL_MODE", "ask_destructive").strip().lower()
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120"))
 AGY_TIMEOUT_SECONDS = int(os.getenv("AGY_TIMEOUT_SECONDS", "180"))
@@ -262,7 +272,26 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"```([a-zA-Z0-9_\+\-]*)?\n([\s\S]*?)```", save_code_block, text)
 
-    # 2. Simpan inline code (`...`)
+    # 2. Simpan GFM pipe tables agar rapi & monospace di mobile Telegram (<pre><code>...</code></pre>)
+    table_pattern = re.compile(
+        r"(?m)^([ \t]*\|?[^\n|]+\|[^\n]*\n"
+        r"[ \t]*\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*:?-+:?[ \t]*\|?[ \t]*(?:\n|$))"
+        r"((?:[ \t]*\|?[^\n|]+\|[^\n]*(?:\n|$))*)"
+    )
+
+    def save_markdown_table(match):
+        raw = match.group(0)
+        has_trailing_newline = raw.endswith("\n")
+        table_raw = raw.strip("\r\n")
+        idx = len(code_blocks)
+        escaped_table = html.escape(table_raw)
+        replacement = f"<pre><code>{escaped_table}</code></pre>"
+        code_blocks.append(replacement)
+        return f"\x00CODEBLOCK{idx}\x00\n" if has_trailing_newline else f"\x00CODEBLOCK{idx}\x00"
+
+    text = table_pattern.sub(save_markdown_table, text)
+
+    # 3. Simpan inline code (`...`)
     inline_codes = []
     def save_inline_code(match):
         code = match.group(1)
@@ -312,27 +341,52 @@ async def safe_send_message(
     chat_id: int,
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-    parse_mode: Optional[str] = ParseMode.HTML
+    parse_mode: Optional[str] = ParseMode.HTML,
+    disable_notification: bool = False,
+    reply_to_message_id: Optional[int] = None
 ) -> Optional[Message]:
     """
     Mengirim pesan Telegram dengan fallback otomatis ke teks polos jika parsing HTML/Markdown gagal.
+    Mendukung silent notification (disable_notification) dan quote reply anchoring (reply_to_message_id).
     """
     try:
         return await bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_markup=reply_markup,
-            parse_mode=parse_mode
+            parse_mode=parse_mode,
+            disable_notification=disable_notification,
+            reply_to_message_id=reply_to_message_id
         )
     except BadRequest as e:
-        logger.warning(f"Formatting parse error saat send_message ({e}). Mengirim ulang sebagai plain text.")
+        logger.warning(f"Error saat send_message ({e}). Mengirim ulang sebagai plain text...")
+        effective_reply_to = reply_to_message_id
+        if "repl" in str(e).lower():
+            effective_reply_to = None
         try:
             return await bot.send_message(
                 chat_id=chat_id,
                 text=text,
                 reply_markup=reply_markup,
-                parse_mode=None
+                parse_mode=None,
+                disable_notification=disable_notification,
+                reply_to_message_id=effective_reply_to
             )
+        except BadRequest as e2:
+            if "repl" in str(e2).lower() and effective_reply_to is not None:
+                # Jika pesan yang di-reply sudah dihapus pengguna, coba kirim tanpa reply_to_message_id
+                try:
+                    return await bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        parse_mode=None,
+                        disable_notification=disable_notification
+                    )
+                except Exception:
+                    pass
+            logger.error(f"Gagal total mengirim pesan plain text: {e2}")
+            return None
         except Exception as e2:
             logger.error(f"Gagal total mengirim pesan plain text: {e2}")
             return None
@@ -1220,6 +1274,7 @@ async def execute_agent_turn(
     """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    reply_id = update.message.message_id if update.message else None
 
     # 1. Evaluasi Hardline Security Blocklist
     if is_hardline_blocked(user_text):
@@ -1231,7 +1286,8 @@ async def execute_agent_turn(
                 f"🚨 **HARDLINE SECURITY BLOCKLIST TRIGGERED!**\n\n"
                 f"Instruksi berikut terdeteksi berisiko katastropik dan **DIBLOKIR TOTAL** demi integritas sistem:\n"
                 f"```bash\n{user_text}\n```"
-            )
+            ),
+            reply_to_message_id=reply_id
         )
         return
 
@@ -1249,15 +1305,19 @@ async def execute_agent_turn(
             await safe_send_message(
                 context.bot,
                 chat_id,
-                "❌ **Instruksi Ditolak.** Eksekusi tidak dijalankan."
+                "❌ **Instruksi Ditolak.** Eksekusi tidak dijalankan.",
+                reply_to_message_id=reply_id
             )
             return
 
-    # 3. Jalankan melalui agy CLI Subprocess
+    # 3. Jalankan melalui agy CLI Subprocess (Silent status notification & quote reply anchor)
     status_msg = await safe_send_message(
         context.bot,
         chat_id,
-        "⏳ *Antigravity sedang berpikir & memproses...*"
+        "⏳ *Antigravity sedang berpikir & memproses...*",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_notification=True,
+        reply_to_message_id=reply_id
     )
 
     stop_typing = asyncio.Event()
@@ -1291,7 +1351,13 @@ async def execute_agent_turn(
             if i == 0 and status_msg:
                 await safe_edit_message(status_msg, chunk, parse_mode=ParseMode.HTML)
             else:
-                await safe_send_message(context.bot, chat_id, chunk, parse_mode=ParseMode.HTML)
+                await safe_send_message(
+                    context.bot,
+                    chat_id,
+                    chunk,
+                    parse_mode=ParseMode.HTML,
+                    reply_to_message_id=reply_id if i == 0 else None
+                )
 
         # Kirim file media yang terdeteksi
         for file_path in media_paths:
@@ -1328,10 +1394,142 @@ async def execute_agent_turn(
         if status_msg:
             await safe_edit_message(status_msg, err_msg)
         else:
-            await safe_send_message(context.bot, chat_id, err_msg)
+            await safe_send_message(context.bot, chat_id, err_msg, reply_to_message_id=reply_id)
     finally:
         stop_typing.set()
         typing_task.cancel()
+
+async def _dispatch_agent_turn(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str
+):
+    """
+    Helper untuk mengeksekusi prompt ke agy CLI subprocess
+    dalam kendali mutex lock dan pelacakan task asinkron per pengguna.
+    """
+    user_id = update.effective_user.id
+
+    # Cek apakah ada tugas yang masih berjalan untuk user ini
+    existing_task = user_tasks.get(user_id)
+    if existing_task and not existing_task.done():
+        if update.message:
+            await update.message.reply_text(
+                "⏳ *Antigravity sedang menyelesaikan tugas sebelumnya.*\n"
+                "Kirim `/cancel` jika Anda ingin menghentikan proses tersebut.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+
+    user_lock = get_user_lock(user_id)
+    if user_lock.locked():
+        if update.message:
+            await update.message.reply_text("⏳ Mohon tunggu sebentar, sesi Anda sedang sibuk.")
+        return
+
+    async def _locked_runner():
+        async with user_lock:
+            await execute_agent_turn(update, context, prompt)
+
+    task = asyncio.create_task(_locked_runner())
+    user_tasks[user_id] = task
+
+    def _cleanup_task(t):
+        if user_tasks.get(user_id) == t:
+            user_tasks.pop(user_id, None)
+
+    task.add_done_callback(_cleanup_task)
+
+
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk gambar / screenshot yang dikirimkan oleh pengguna."""
+    if not is_authorized(update):
+        logger.warning(
+            f"Unauthorized photo upload attempt from User ID: "
+            f"{update.effective_user.id if update.effective_user else 'Unknown'}"
+        )
+        return
+
+    if not update.message or not update.message.photo:
+        return
+
+    user_id = update.effective_user.id
+    # Ambil foto dengan resolusi tertinggi (elemen terakhir dalam daftar photo)
+    photo = update.message.photo[-1]
+
+    try:
+        file_obj = await photo.get_file()
+        upload_dir = get_upload_dir()
+        filename = f"photo_{int(time.time())}_{uuid.uuid4().hex[:6]}.jpg"
+        dest_path = (upload_dir / filename).resolve()
+        await file_obj.download_to_drive(custom_path=dest_path)
+        logger.info(f"Foto berhasil diunduh ke: {dest_path}")
+    except Exception as e:
+        logger.error(f"Gagal mengunduh foto untuk user {user_id}: {e}", exc_info=True)
+        if update.message:
+            await update.message.reply_text(f"❌ Gagal mengunduh foto: {e}")
+        return
+
+    caption = (update.message.caption or "").strip()
+    caption_prompt = caption if caption else "Tolong periksa dan analisis gambar terlampir ini."
+
+    prompt_text = (
+        f"[PENGGUNA MENGIRIMKAN GAMBAR / SCREENSHOT]\n"
+        f"Berkas gambar telah disimpan di: {dest_path}\n\n"
+        f"[INSTRUKSI / CAPTION PENGGUNA]:\n"
+        f"{caption_prompt}"
+    )
+
+    await _dispatch_agent_turn(update, context, prompt_text)
+
+
+async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk berkas dokumen / kode / log yang dikirimkan oleh pengguna."""
+    if not is_authorized(update):
+        logger.warning(
+            f"Unauthorized document upload attempt from User ID: "
+            f"{update.effective_user.id if update.effective_user else 'Unknown'}"
+        )
+        return
+
+    if not update.message or not update.message.document:
+        return
+
+    user_id = update.effective_user.id
+    doc = update.message.document
+
+    try:
+        file_obj = await doc.get_file()
+        orig_name = doc.file_name or f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        safe_name = Path(orig_name).name
+        if not safe_name:
+            safe_name = f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+
+        prefix = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_"
+        filename = f"{prefix}{safe_name}"
+        upload_dir = get_upload_dir()
+        dest_path = (upload_dir / filename).resolve()
+        await file_obj.download_to_drive(custom_path=dest_path)
+        logger.info(f"Dokumen '{orig_name}' berhasil diunduh ke: {dest_path}")
+    except Exception as e:
+        logger.error(f"Gagal mengunduh dokumen untuk user {user_id}: {e}", exc_info=True)
+        if update.message:
+            await update.message.reply_text(f"❌ Gagal mengunduh dokumen: {e}")
+        return
+
+    caption = (update.message.caption or "").strip()
+    caption_prompt = caption if caption else "Tolong periksa, baca, dan analisis dokumen terlampir ini."
+
+    prompt_text = (
+        f"[PENGGUNA MENGIRIMKAN DOKUMEN / BERKAS]\n"
+        f"Nama berkas asli: {orig_name}\n"
+        f"Berkas telah disimpan di: {dest_path}\n\n"
+        f"[INSTRUKSI / CAPTION PENGGUNA]:\n"
+        f"{caption_prompt}"
+    )
+
+    await _dispatch_agent_turn(update, context, prompt_text)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Router utama untuk pesan teks yang masuk dari pengguna."""
@@ -1372,37 +1570,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_send_message(context.bot, update.effective_chat.id, err_msg, parse_mode=ParseMode.HTML)
         return
 
-    # Cek apakah ada tugas yang masih berjalan untuk user ini
-    existing_task = user_tasks.get(user_id)
-    if existing_task and not existing_task.done():
-        await update.message.reply_text(
-            "⏳ *Antigravity sedang menyelesaikan tugas sebelumnya.*\n"
-            "Kirim `/cancel` jika Anda ingin menghentikan proses tersebut.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    user_lock = get_user_lock(user_id)
-    if user_lock.locked():
-        await update.message.reply_text("⏳ Mohon tunggu sebentar, sesi Anda sedang sibuk.")
-        return
-
-    async def _locked_runner():
-        async with user_lock:
-            await execute_agent_turn(update, context, user_text)
-
-    task = asyncio.create_task(_locked_runner())
-    user_tasks[user_id] = task
-
-    def _cleanup_task(t):
-        if user_tasks.get(user_id) == t:
-            user_tasks.pop(user_id, None)
-
-    task.add_done_callback(_cleanup_task)
+    await _dispatch_agent_turn(update, context, user_text)
 
 # ==============================================================================
-# MAIN APPLICATION ENTRYPOINT & SHUTDOWN LIFECYCLE
+# MAIN APPLICATION ENTRYPOINT & LIFECYCLE HOOKS
 # ==============================================================================
+async def post_init(application):
+    """Mendaftarkan menu perintah bot secara otomatis ke Telegram API saat startup."""
+    commands = [
+        BotCommand("usage", "📊 Cek kuota model & sisa limit"),
+        BotCommand("status", "ℹ️ Status engine, PID, & memori"),
+        BotCommand("cancel", "🛑 Hentikan tugas aktif seketika"),
+        BotCommand("reset", "🔄 Mulai sesi percakapan baru"),
+        BotCommand("help", "📖 Panduan bantuan & perintah"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+        logger.info("✓ BotCommand menu resmi berhasil didaftarkan ke Telegram API.")
+    except Exception as e:
+        logger.warning(f"Gagal mendaftarkan bot commands: {e}")
+
 async def post_shutdown(application):
     """Membersihkan seluruh subprocess agy yang masih berjalan saat bot dimatikan."""
     logger.info("Menutup seluruh subprocess Antigravity...")
@@ -1429,7 +1616,13 @@ def main():
     logger.info(f"⚙️ Approval Mode      : {APPROVAL_MODE} (Timeout: {APPROVAL_TIMEOUT_SECONDS}s)")
     logger.info(f"📁 Workspace Path     : {WORKSPACE_DIR}")
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_shutdown(post_shutdown).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # Daftarkan command handlers
     app.add_handler(CommandHandler("start", start_command))
@@ -1441,6 +1634,10 @@ def main():
 
     # Daftarkan handler tombol konfirmasi Approve / Deny
     app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Daftarkan handler pesan media & dokumen
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
 
     # Daftarkan handler pesan teks
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

@@ -42,3 +42,7 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+
+# Telegram Uploads
+.telegram_uploads/
+

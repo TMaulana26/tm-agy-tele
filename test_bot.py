@@ -709,6 +709,315 @@ docker ps -a
                     self.assertEqual(conv_id, "conv-timeout-2")
                     mock_proc.terminate.assert_called_once()
 
+    # --------------------------------------------------------------------------
+    # 12. TELEGRAM UX ENHANCEMENTS (HERMES-INSPIRED)
+    # --------------------------------------------------------------------------
+    async def test_post_init_set_my_commands_success(self):
+        mock_app = MagicMock()
+        mock_app.bot.set_my_commands = AsyncMock()
+
+        await bot.post_init(mock_app)
+        mock_app.bot.set_my_commands.assert_called_once()
+        commands = mock_app.bot.set_my_commands.call_args[0][0]
+        cmd_names = [c.command for c in commands]
+        self.assertEqual(cmd_names, ["usage", "status", "cancel", "reset", "help"])
+
+    async def test_post_init_set_my_commands_error_handled(self):
+        mock_app = MagicMock()
+        mock_app.bot.set_my_commands = AsyncMock(side_effect=Exception("Network error"))
+
+        try:
+            await bot.post_init(mock_app)
+        except Exception as e:
+            self.fail(f"post_init raised unexpected exception: {e}")
+
+    async def test_safe_send_message_with_reply_and_silent(self):
+        mock_bot = AsyncMock()
+        mock_msg = MagicMock(message_id=101)
+        mock_bot.send_message.return_value = mock_msg
+
+        res = await bot.safe_send_message(
+            bot=mock_bot,
+            chat_id=123,
+            text="Pesan status",
+            disable_notification=True,
+            reply_to_message_id=987
+        )
+        self.assertEqual(res, mock_msg)
+        mock_bot.send_message.assert_called_once_with(
+            chat_id=123,
+            text="Pesan status",
+            reply_markup=None,
+            parse_mode=bot.ParseMode.HTML,
+            disable_notification=True,
+            reply_to_message_id=987
+        )
+
+    async def test_safe_send_message_reply_deleted_fallback(self):
+        mock_bot = AsyncMock()
+        mock_msg = MagicMock(message_id=102)
+        mock_bot.send_message.side_effect = [
+            bot.BadRequest("Can't find end of entities"),
+            bot.BadRequest("Message to be replied not found"),
+            mock_msg
+        ]
+
+        res = await bot.safe_send_message(
+            bot=mock_bot,
+            chat_id=123,
+            text="Pesan fallback",
+            disable_notification=True,
+            reply_to_message_id=987
+        )
+        self.assertEqual(res, mock_msg)
+        self.assertEqual(mock_bot.send_message.call_count, 3)
+        last_kwargs = mock_bot.send_message.call_args.kwargs
+        self.assertNotIn("reply_to_message_id", last_kwargs)
+
+    def test_markdown_to_telegram_html_table_wrapping(self):
+        table_md = (
+            "Berikut tabel spesifikasi:\n\n"
+            "| Fitur | Status | Keterangan |\n"
+            "| :--- | :---: | ---: |\n"
+            "| RAM | 35MB | Hemat |\n"
+            "| Storage | SSD | Cepat |\n\n"
+            "Selesai."
+        )
+        out = bot.markdown_to_telegram_html(table_md)
+        self.assertIn("Berikut tabel spesifikasi:", out)
+        self.assertIn("<pre><code>| Fitur | Status | Keterangan |", out)
+        self.assertIn("| Storage | SSD | Cepat |</code></pre>", out)
+        self.assertIn("Selesai.", out)
+
+    def test_markdown_to_telegram_html_multiple_tables(self):
+        md = (
+            "Tabel 1:\n"
+            "| A | B |\n"
+            "|---|---|\n"
+            "| 1 | 2 |\n\n"
+            "Tabel 2:\n"
+            "| X | Y |\n"
+            "|---|---|\n"
+            "| 8 | 9 |\n"
+        )
+        out = bot.markdown_to_telegram_html(md)
+        self.assertEqual(out.count("<pre><code>"), 2)
+        self.assertIn("<pre><code>| A | B |\n|---|---|\n| 1 | 2 |</code></pre>", out)
+        self.assertIn("<pre><code>| X | Y |\n|---|---|\n| 8 | 9 |</code></pre>", out)
+
+    def test_markdown_to_telegram_html_table_inside_codeblock_not_double_wrapped(self):
+        md = (
+            "```markdown\n"
+            "| Col1 | Col2 |\n"
+            "| --- | --- |\n"
+            "| Val1 | Val2 |\n"
+            "```"
+        )
+        out = bot.markdown_to_telegram_html(md)
+        self.assertEqual(out.count("<pre>"), 1)
+        self.assertIn('<pre><code class="language-markdown">', out)
+
+    def test_get_upload_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                up_dir = bot.get_upload_dir()
+                self.assertTrue(up_dir.exists())
+                self.assertTrue(up_dir.is_dir())
+                self.assertEqual(up_dir.name, ".telegram_uploads")
+
+    async def test_handle_photo_message_unauthorized(self):
+        update = MagicMock()
+        update.effective_user.id = 999999  # Unauthorized
+        context = MagicMock()
+
+        with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+            await bot.handle_photo_message(update, context)
+            mock_dispatch.assert_not_called()
+
+    async def test_handle_photo_message_flow(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                update = MagicMock()
+                update.effective_user.id = 111111  # Authorized
+                update.message.caption = "Periksa screenshot error ini"
+
+                mock_photo_small = MagicMock()
+                mock_photo_large = MagicMock()
+                mock_file = AsyncMock()
+                mock_photo_large.get_file = AsyncMock(return_value=mock_file)
+                update.message.photo = [mock_photo_small, mock_photo_large]
+
+                context = MagicMock()
+
+                with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+                    await bot.handle_photo_message(update, context)
+                    mock_file.download_to_drive.assert_called_once()
+                    mock_dispatch.assert_called_once()
+                    prompt_arg = mock_dispatch.call_args[0][2]
+                    self.assertIn("[PENGGUNA MENGIRIMKAN GAMBAR / SCREENSHOT]", prompt_arg)
+                    self.assertIn("Periksa screenshot error ini", prompt_arg)
+                    self.assertIn(".telegram_uploads", prompt_arg)
+
+    async def test_handle_photo_message_download_error(self):
+        update = MagicMock()
+        update.effective_user.id = 111111  # Authorized
+        update.message.photo = [MagicMock()]
+        update.message.photo[-1].get_file = AsyncMock(side_effect=Exception("Download failed"))
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+
+        with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+            await bot.handle_photo_message(update, context)
+            mock_dispatch.assert_not_called()
+            update.message.reply_text.assert_called_once()
+            self.assertIn("Gagal mengunduh foto", update.message.reply_text.call_args[0][0])
+
+    async def test_handle_document_message_unauthorized(self):
+        update = MagicMock()
+        update.effective_user.id = 999999  # Unauthorized
+        context = MagicMock()
+
+        with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+            await bot.handle_document_message(update, context)
+            mock_dispatch.assert_not_called()
+
+    async def test_handle_document_message_flow(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                update = MagicMock()
+                update.effective_user.id = 111111  # Authorized
+                update.message.caption = "Baca file log ini"
+                mock_doc = MagicMock()
+                mock_doc.file_name = "server_error.log"
+                mock_file = AsyncMock()
+                mock_doc.get_file = AsyncMock(return_value=mock_file)
+                update.message.document = mock_doc
+
+                context = MagicMock()
+
+                with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+                    await bot.handle_document_message(update, context)
+                    mock_file.download_to_drive.assert_called_once()
+                    mock_dispatch.assert_called_once()
+                    prompt_arg = mock_dispatch.call_args[0][2]
+                    self.assertIn("[PENGGUNA MENGIRIMKAN DOKUMEN / BERKAS]", prompt_arg)
+                    self.assertIn("server_error.log", prompt_arg)
+                    self.assertIn("Baca file log ini", prompt_arg)
+                    self.assertIn(".telegram_uploads", prompt_arg)
+
+    async def test_handle_document_message_download_error(self):
+        update = MagicMock()
+        update.effective_user.id = 111111  # Authorized
+        update.message.document = MagicMock()
+        update.message.document.get_file = AsyncMock(side_effect=Exception("Disk full"))
+        update.message.reply_text = AsyncMock()
+        context = MagicMock()
+
+        with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+            await bot.handle_document_message(update, context)
+            mock_dispatch.assert_not_called()
+            update.message.reply_text.assert_called_once()
+            self.assertIn("Gagal mengunduh dokumen", update.message.reply_text.call_args[0][0])
+
+    async def test_execute_agent_turn_silent_status_and_reply_anchor(self):
+        update = MagicMock()
+        update.effective_user.id = 111111
+        update.effective_chat.id = 123
+        update.message.message_id = 777
+
+        context = MagicMock()
+        mock_status_msg = AsyncMock()
+        mock_status_msg.message_id = 888
+
+        with patch("bot.safe_send_message", new=AsyncMock(return_value=mock_status_msg)) as mock_send:
+            with patch("bot.run_agy_cli", new=AsyncMock(return_value=("Hasil respons", "conv-turn-1"))):
+                with patch("bot.safe_edit_message", new=AsyncMock(return_value=True)):
+                    await bot.execute_agent_turn(update, context, "halo bot")
+                    self.assertTrue(mock_send.called)
+                    first_call = mock_send.call_args_list[0]
+                    self.assertEqual(first_call.kwargs.get("disable_notification"), True)
+                    self.assertEqual(first_call.kwargs.get("reply_to_message_id"), 777)
+
+    async def test_handle_photo_message_empty_caption_default_prompt(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                update = MagicMock()
+                update.effective_user.id = 111111
+                update.message.caption = None  # No caption
+                mock_photo = MagicMock()
+                mock_file = AsyncMock()
+                mock_photo.get_file = AsyncMock(return_value=mock_file)
+                update.message.photo = [mock_photo]
+
+                context = MagicMock()
+                with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+                    await bot.handle_photo_message(update, context)
+                    mock_dispatch.assert_called_once()
+                    prompt_arg = mock_dispatch.call_args[0][2]
+                    self.assertIn("Tolong periksa dan analisis gambar terlampir ini.", prompt_arg)
+
+    async def test_handle_document_message_path_traversal_sanitized(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                update = MagicMock()
+                update.effective_user.id = 111111
+                update.message.caption = None
+                mock_doc = MagicMock()
+                mock_doc.file_name = "../../../etc/passwd"  # Directory traversal attempt
+                mock_file = AsyncMock()
+                mock_doc.get_file = AsyncMock(return_value=mock_file)
+                update.message.document = mock_doc
+
+                context = MagicMock()
+                with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+                    await bot.handle_document_message(update, context)
+                    mock_dispatch.assert_called_once()
+                    dest_call_arg = mock_file.download_to_drive.call_args.kwargs.get("custom_path")
+                    # The saved file must reside safely inside .telegram_uploads
+                    self.assertTrue(str(dest_call_arg).startswith(tmpdir))
+                    self.assertIn(".telegram_uploads", str(dest_call_arg))
+                    self.assertTrue(str(dest_call_arg).endswith("passwd"))
+
+    async def test_handle_document_message_empty_filename_fallback(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                update = MagicMock()
+                update.effective_user.id = 111111
+                update.message.caption = ""
+                mock_doc = MagicMock()
+                mock_doc.file_name = ""  # Empty filename
+                mock_file = AsyncMock()
+                mock_doc.get_file = AsyncMock(return_value=mock_file)
+                update.message.document = mock_doc
+
+                context = MagicMock()
+                with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+                    await bot.handle_document_message(update, context)
+                    mock_dispatch.assert_called_once()
+                    prompt_arg = mock_dispatch.call_args[0][2]
+                    self.assertIn("doc_", prompt_arg)
+                    self.assertIn("Tolong periksa, baca, dan analisis dokumen terlampir ini.", prompt_arg)
+
+    def test_markdown_to_telegram_html_table_special_chars(self):
+        table_md = (
+            "| Tag | Symbol | Logic |\n"
+            "| --- | --- | --- |\n"
+            "| <script> | & | _test_var_ |\n"
+        )
+        out = bot.markdown_to_telegram_html(table_md)
+        self.assertIn("&lt;script&gt;", out)
+        self.assertIn("&amp;", out)
+        self.assertIn("_test_var_", out)
+        # Should not be converted to <i>test</i> inside table pre block
+        self.assertNotIn("<i>", out)
+
 if __name__ == "__main__":
     unittest.main()
+
 
