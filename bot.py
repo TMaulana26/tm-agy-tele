@@ -305,10 +305,32 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"`([^`\n]+)`", save_inline_code, text)
 
-    # 3. Escape HTML pada sisa teks biasa (&, <, >)
+    # 4. Simpan link file:/// lokal sebagai inline code (karena tidak dapat dibuka di Telegram client)
+    def clean_file_link(match):
+        label = match.group(1).strip()
+        idx = len(inline_codes)
+        escaped_label = html.escape(label)
+        inline_codes.append(f"<code>{escaped_label}</code>")
+        return f"\x00INLINECODE{idx}\x00"
+
+    text = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", clean_file_link, text)
+
+    # 5. Simpan tautan web standar [label](https://...) -> <a href="...">label</a>
+    def save_web_link(match):
+        label = match.group(1).strip()
+        url = match.group(2).strip()
+        idx = len(inline_codes)
+        escaped_label = html.escape(label)
+        escaped_url = html.escape(url, quote=True)
+        inline_codes.append(f'<a href="{escaped_url}">{escaped_label}</a>')
+        return f"\x00INLINECODE{idx}\x00"
+
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", save_web_link, text)
+
+    # 6. Escape HTML pada sisa teks biasa (&, <, >)
     text = html.escape(text)
 
-    # 4. Format headers (###, ##, #) menjadi bold tanpa tanda pagar dan tanpa double **
+    # 7. Format headers (###, ##, #) menjadi bold tanpa tanda pagar dan tanpa double **
     def format_header(match):
         content = match.group(1).strip()
         clean_content = re.sub(r"\*\*(.*?)\*\*", r"\1", content)
@@ -316,28 +338,51 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"(?m)^#{1,6}\s*(.*?)$", format_header, text)
 
-    # 5. Format bullet points (* atau - di awal baris) menjadi simbol bullet rapi (• )
+    # 8. Format bullet points (* atau - di awal baris) menjadi simbol bullet rapi (• )
     text = re.sub(r"(?m)^[\*\-]\s+", r"• ", text)
 
-    # 6. Format bold (**text** atau __text__) -> <b>text</b>
+    # 9. Format bold (**text** atau __text__) -> <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
 
-    # 7. Format italic (*text* atau _text_)
+    # 10. Format italic (*text* atau _text_)
     text = re.sub(r"(?<!\w)\*([^\*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", text)
 
-    # 8. Format blockquote (> text) -> <blockquote>text</blockquote>
-    text = re.sub(r"(?m)^&gt;\s*(.*?)$", r"<blockquote>\1</blockquote>", text)
+    # 11. Format blockquote berturut-turut (> text) menjadi satu <blockquote>...</blockquote>
+    def format_contiguous_blockquotes(match):
+        block = match.group(0)
+        lines = []
+        for line in block.splitlines():
+            cleaned = re.sub(r"^&gt;\s?", "", line).strip()
+            lines.append(cleaned)
+        content = "\n".join(lines).strip()
 
-    # 9. Kembalikan inline codes dan code blocks
+        # Konversi GitHub-style alerts ([!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION])
+        alert_map = {
+            "[!NOTE]": "💡 <b>Catatan:</b>\n",
+            "[!TIP]": "💡 <b>Tips:</b>\n",
+            "[!IMPORTANT]": "📌 <b>Penting:</b>\n",
+            "[!WARNING]": "⚠️ <b>Peringatan:</b>\n",
+            "[!CAUTION]": "🛑 <b>Perhatian:</b>\n",
+        }
+        for tag, header in alert_map.items():
+            if content.startswith(tag):
+                content = header + content[len(tag):].lstrip()
+                break
+
+        return f"<blockquote>{content}</blockquote>\n"
+
+    text = re.sub(r"(?m)(?:^&gt;.*$\n?)+", format_contiguous_blockquotes, text)
+
+    # 12. Kembalikan inline codes dan code blocks
     for idx, replacement in enumerate(inline_codes):
         text = text.replace(f"\x00INLINECODE{idx}\x00", replacement)
 
     for idx, replacement in enumerate(code_blocks):
         text = text.replace(f"\x00CODEBLOCK{idx}\x00", replacement)
 
-    return text
+    return text.strip()
 
 async def safe_send_message(
     bot,
@@ -1334,6 +1379,7 @@ async def execute_agent_turn(
             return
 
     # 3. Jalankan melalui agy CLI Subprocess (Silent status notification & quote reply anchor)
+    turn_start_time = time.time()
     status_msg = await safe_send_message(
         context.bot,
         chat_id,
@@ -1357,6 +1403,9 @@ async def execute_agent_turn(
             cwd=WORKSPACE_DIR
         )
 
+        elapsed_seconds = max(1, int(time.time() - turn_start_time))
+        duration_str = f"~{elapsed_seconds}s" if elapsed_seconds < 60 else f"~{elapsed_seconds // 60}m {elapsed_seconds % 60}s"
+
         # Simpan atau perbarui conversation_id untuk memori multi-turn
         if new_conv_id:
             user_conversations[user_id] = new_conv_id
@@ -1367,28 +1416,30 @@ async def execute_agent_turn(
         # 5. Format teks output menggunakan konverter Telegram HTML yang rapi & aman
         formatted_html = markdown_to_telegram_html(output_text)
 
+        # Tambahkan badge durasi pengerjaan jika belum ada di dalam output
+        if "⏱️" not in formatted_html and "durasi pengerjaan" not in formatted_html.lower():
+            formatted_html = f"{formatted_html.rstrip()}\n\n⏱️ <i>Respons dalam {duration_str}</i>"
+
         # 6. Potong teks agar muat di batas limit Telegram (4000 char)
         chunks = split_message(formatted_html, max_length=4000)
 
+        # Hapus pesan status tunggu sementara agar balasan final memiliki timestamp asli & memicu notifikasi baru
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            status_msg = None
+
         for i, chunk in enumerate(chunks):
-            if i == 0 and status_msg:
-                edited = await safe_edit_message(status_msg, chunk, parse_mode=ParseMode.HTML)
-                if not edited:
-                    await safe_send_message(
-                        context.bot,
-                        chat_id,
-                        chunk,
-                        parse_mode=ParseMode.HTML,
-                        reply_to_message_id=reply_id
-                    )
-            else:
-                await safe_send_message(
-                    context.bot,
-                    chat_id,
-                    chunk,
-                    parse_mode=ParseMode.HTML,
-                    reply_to_message_id=reply_id if i == 0 else None
-                )
+            await safe_send_message(
+                context.bot,
+                chat_id,
+                chunk,
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=reply_id if i == 0 else None,
+                disable_notification=False
+            )
 
         # Kirim file media yang terdeteksi
         for file_path in media_paths:
@@ -1414,23 +1465,41 @@ async def execute_agent_turn(
         logger.info(f"Task user {user_id} dibatalkan.")
         cancel_text = "🛑 *Tugas dibatalkan oleh pengguna via /cancel.*"
         if status_msg:
-            edited = await safe_edit_message(status_msg, cancel_text)
-            if not edited:
-                await safe_send_message(context.bot, chat_id, cancel_text, reply_to_message_id=reply_id)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            status_msg = None
+        await safe_send_message(
+            context.bot,
+            chat_id,
+            cancel_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_to_message_id=reply_id,
+            disable_notification=False
+        )
         raise
     except Exception as e:
         logger.error(f"Error saat mengeksekusi agy: {e}", exc_info=True)
         err_msg = (
-            f"❌ **Terjadi kesalahan saat memproses permintaan:**\n"
-            f"```text\n{str(e)[:1000]}\n```\n\n"
-            f"💡 *Petunjuk:* Pastikan binary `agy` terpasang di path yang sesuai atau gunakan `/reset` untuk me-restart sesi."
+            f"❌ <b>Terjadi kesalahan saat memproses permintaan:</b>\n"
+            f"<pre><code>{html.escape(str(e))[:1000]}</code></pre>\n\n"
+            f"💡 <i>Petunjuk:</i> Pastikan binary <code>agy</code> terpasang di path yang sesuai atau gunakan <code>/reset</code> untuk me-restart sesi."
         )
         if status_msg:
-            edited = await safe_edit_message(status_msg, err_msg)
-            if not edited:
-                await safe_send_message(context.bot, chat_id, err_msg, reply_to_message_id=reply_id)
-        else:
-            await safe_send_message(context.bot, chat_id, err_msg, reply_to_message_id=reply_id)
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            status_msg = None
+        await safe_send_message(
+            context.bot,
+            chat_id,
+            err_msg,
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=reply_id,
+            disable_notification=False
+        )
     finally:
         stop_typing.set()
         typing_task.cancel()

@@ -1095,7 +1095,67 @@ docker ps -a
                     call_text = second_call.args[2] if len(second_call.args) > 2 else second_call.kwargs.get("text", "")
                     self.assertIn("Hasil respons", call_text)
 
+    def test_markdown_to_telegram_html_github_alert_callouts(self):
+        sample = (
+            "> [!NOTE]\n"
+            "> Pengecekan crontab sistem Linux host (`crontab -l`) saat ini masih kosong.\n"
+            "> Jadwal otomatis akan dipasang ke host VPS."
+        )
+        converted = bot.markdown_to_telegram_html(sample)
+        self.assertIn("<blockquote>", converted)
+        self.assertIn("💡 <b>Catatan:</b>", converted)
+        self.assertIn("<code>crontab -l</code>", converted)
+        self.assertNotIn("[!NOTE]", converted)
+
+        # Uji alert [!WARNING] dan [!TIP]
+        sample_warn = "> [!WARNING]\n> Tindakan ini berbahaya!"
+        converted_warn = bot.markdown_to_telegram_html(sample_warn)
+        self.assertIn("⚠️ <b>Peringatan:</b>", converted_warn)
+
+        sample_tip = "> [!TIP]\n> Gunakan flag --bail."
+        converted_tip = bot.markdown_to_telegram_html(sample_tip)
+        self.assertIn("💡 <b>Tips:</b>", converted_tip)
+
+    def test_markdown_to_telegram_html_file_links(self):
+        sample = "Lihat script di [check_server_health.sh](file:///home/ubuntu/.gemini/check_server_health.sh)"
+        converted = bot.markdown_to_telegram_html(sample)
+        self.assertNotIn("file:///", converted)
+        self.assertIn("<code>check_server_health.sh</code>", converted)
+
+    def test_markdown_to_telegram_html_web_links(self):
+        sample = "Kunjungi [Portal Google](https://google.com) untuk info lebih lanjut."
+        converted = bot.markdown_to_telegram_html(sample)
+        self.assertIn('<a href="https://google.com">Portal Google</a>', converted)
+
+    async def test_execute_agent_turn_fresh_message_and_duration_badge(self):
+        update = MagicMock()
+        update.effective_user.id = 111111
+        update.effective_chat.id = 123
+        update.message.message_id = 777
+
+        context = MagicMock()
+        mock_status_msg = AsyncMock()
+        mock_status_msg.message_id = 888
+
+        with patch("bot.safe_send_message", new=AsyncMock(return_value=mock_status_msg)) as mock_send:
+            with patch("bot.run_agy_cli", new=AsyncMock(return_value=("Tugas selesai diproses.", "conv-duration-1"))):
+                await bot.execute_agent_turn(update, context, "jalankan audit")
+
+                # Memverifikasi bahwa status_msg dihapus
+                mock_status_msg.delete.assert_called_once()
+
+                # Memverifikasi bahwa balasan dikirim sebagai pesan baru dengan reply_to dan disable_notification=False
+                self.assertEqual(mock_send.call_count, 2)
+                final_call = mock_send.call_args_list[1]
+                self.assertEqual(final_call.kwargs.get("reply_to_message_id"), 777)
+                self.assertEqual(final_call.kwargs.get("disable_notification"), False)
+
+                final_text = final_call.args[2] if len(final_call.args) > 2 else final_call.kwargs.get("text", "")
+                self.assertIn("Tugas selesai diproses.", final_text)
+                self.assertIn("⏱️ <i>Respons dalam", final_text)
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
