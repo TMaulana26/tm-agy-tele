@@ -326,6 +326,8 @@ class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
         context.bot.send_message.assert_called_once()
         args, kwargs = context.bot.send_message.call_args
         self.assertIn("Status Sistem Antigravity Bot", kwargs.get("text", ""))
+        self.assertIn("Execution Timeout", kwargs.get("text", ""))
+
 
     async def test_reset_command(self):
         update = MagicMock()
@@ -584,5 +586,129 @@ docker ps -a
                 call_kwargs = mock_status_msg.edit_text.call_args.kwargs
                 self.assertIn("Laporan Kuota Intercepted", call_kwargs.get("text", ""))
 
+    # --------------------------------------------------------------------------
+    # 11. HEADLESS RESILIENCE & SUBPROCESS TIMEOUT RECOVERY
+    # --------------------------------------------------------------------------
+    def test_build_cli_prompt(self):
+        prompt = "buatkan cron job jam 8 pagi"
+        built = bot.build_cli_prompt(prompt)
+        self.assertIn("JANGAN PERNAH menggunakan tool internal `schedule`", built)
+        self.assertIn("crontab", built)
+        self.assertIn("[PERMINTAAN PENGGUNA]\nbuatkan cron job jam 8 pagi", built)
+
+    def test_recover_last_response_success(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            conv_id = "test-conv-12345"
+            log_dir = tmppath / ".gemini" / "brain" / conv_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            transcript_file = log_dir / "transcript.jsonl"
+
+            lines = [
+                json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "buat script"}),
+                json.dumps({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "schedule"}]}),
+                json.dumps({"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "RUNNING", "content": "Tool is running"}),
+                json.dumps({"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "Siap! Cron job sudah aktif."})
+            ]
+            transcript_file.write_text("\n".join(lines), encoding="utf-8")
+
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                recovered, res_id = bot.recover_last_response_from_transcript(conv_id)
+                self.assertEqual(recovered, "Siap! Cron job sudah aktif.")
+                self.assertEqual(res_id, conv_id)
+
+    def test_recover_last_response_anti_stale_protection(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            conv_id = "test-conv-anti-stale"
+            log_dir = tmppath / ".gemini" / "brain" / conv_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            transcript_file = log_dir / "transcript.jsonl"
+
+            lines = [
+                json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "halo"}),
+                json.dumps({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "Jawaban lama turn 1"}),
+                json.dumps({"step_index": 2, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "jalankan perintah hang"}),
+                json.dumps({"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]}),
+                json.dumps({"step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "RUNNING", "content": "running..."})
+            ]
+            transcript_file.write_text("\n".join(lines), encoding="utf-8")
+
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                recovered, res_id = bot.recover_last_response_from_transcript(conv_id)
+                # Harus None karena terhenti di baris USER_INPUT sebelum ada PLANNER_RESPONSE baru
+                self.assertIsNone(recovered)
+                self.assertEqual(res_id, conv_id)
+
+    def test_recover_last_response_new_conversation_autodiscovery(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            conv_id = "new-conv-autodiscovered"
+            log_dir = tmppath / ".gemini" / "brain" / conv_id / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            transcript_file = log_dir / "transcript.jsonl"
+
+            lines = [
+                json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "halo pertama"}),
+                json.dumps({"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "Halo! Ini jawaban sesi baru."})
+            ]
+            transcript_file.write_text("\n".join(lines), encoding="utf-8")
+
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                # conv_id None (sesi baru)
+                recovered, res_id = bot.recover_last_response_from_transcript(None)
+                self.assertEqual(recovered, "Halo! Ini jawaban sesi baru.")
+                self.assertEqual(res_id, conv_id)
+
+    async def test_run_agy_cli_timeout_with_recovery(self):
+        mock_proc = AsyncMock()
+        mock_proc.pid = 8888
+        mock_proc.communicate.side_effect = asyncio.TimeoutError()
+        mock_proc.wait = AsyncMock(return_value=0)
+        mock_proc.terminate = MagicMock()
+        mock_proc.kill = MagicMock()
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            with patch("os.path.exists", return_value=True):
+                with patch("bot.recover_last_response_from_transcript", return_value=("Jawaban pulih!", "conv-timeout-1")):
+                    resp, conv_id = await bot.run_agy_cli(
+                        user_id=111111,
+                        prompt="tugas berat",
+                        conv_id="conv-timeout-1",
+                        cwd="."
+                    )
+                    self.assertIn("Jawaban pulih!", resp)
+                    self.assertIn("melebihi batas waktu", resp)
+                    self.assertEqual(conv_id, "conv-timeout-1")
+                    mock_proc.terminate.assert_called_once()
+
+                    call_args = mock_exec.call_args[0]
+                    self.assertIn("--print-timeout", call_args)
+
+    async def test_run_agy_cli_timeout_without_recovery(self):
+        mock_proc = AsyncMock()
+        mock_proc.pid = 8888
+        mock_proc.communicate.side_effect = asyncio.TimeoutError()
+        mock_proc.wait = AsyncMock(return_value=0)
+        mock_proc.terminate = MagicMock()
+        mock_proc.kill = MagicMock()
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with patch("os.path.exists", return_value=True):
+                with patch("bot.recover_last_response_from_transcript", return_value=(None, "conv-timeout-2")):
+                    resp, conv_id = await bot.run_agy_cli(
+                        user_id=111111,
+                        prompt="tugas berat macet",
+                        conv_id="conv-timeout-2",
+                        cwd="."
+                    )
+                    self.assertIn("Waktu eksekusi habis (Timeout", resp)
+                    self.assertEqual(conv_id, "conv-timeout-2")
+                    mock_proc.terminate.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main()
+

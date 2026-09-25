@@ -104,6 +104,28 @@ def resolve_workspace_dir() -> str:
 WORKSPACE_DIR = resolve_workspace_dir()
 APPROVAL_MODE = os.getenv("APPROVAL_MODE", "ask_destructive").strip().lower()
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120"))
+AGY_TIMEOUT_SECONDS = int(os.getenv("AGY_TIMEOUT_SECONDS", "180"))
+
+# ==============================================================================
+# SYSTEM INSTRUCTIONS & PROMPT BUILDER
+# ==============================================================================
+SYSTEM_INSTRUCTIONS = (
+    "Anda adalah asisten AI Antigravity yang terhubung melalui Telegram Bot di VPS Linux. "
+    f"Direktori kerja utama: {WORKSPACE_DIR}.\n\n"
+    "ATURAN OPERASIONAL PENTING:\n"
+    "1. Anda berjalan dalam sesi headless non-interaktif (print mode).\n"
+    "2. JANGAN PERNAH menggunakan tool internal `schedule` untuk recurring cron atau background timers. "
+    "Jika pengguna meminta cron job atau penjadwalan otomatis, selalu buat script dan pasang langsung ke crontab Linux host via terminal (`crontab`).\n"
+    "3. Selalu selesaikan eksekusi perintah terminal sebelum mengakhiri giliran Anda."
+)
+
+def build_cli_prompt(prompt: str) -> str:
+    """
+    Menyusun prompt pengguna dengan menyisipkan instruksi operasional headless VPS
+    agar model AI tidak menggunakan tool internal schedule dan selalu mengutamakan crontab host.
+    """
+    return f"[INSTRUKSI SISTEM]\n{SYSTEM_INSTRUCTIONS}\n\n[PERMINTAAN PENGGUNA]\n{prompt}"
+
 
 # ==============================================================================
 # STATE & REGISTRY
@@ -501,6 +523,118 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 future.set_result(False)
 
 # ==============================================================================
+# TRANSCRIPT DISCOVERY & FALLBACK RECOVERY
+# ==============================================================================
+def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
+    """
+    Mencari lokasi berkas transcript.jsonl untuk conv_id tertentu.
+    Jika conv_id adalah None, otomatis mencari sesi percakapan terbaru di folder brain.
+    Mengembalikan tuple: (transcript_path, resolved_conv_id).
+    """
+    candidate_bases: List[Path] = []
+
+    # 1. Direktori home pengguna saat ini
+    home = Path.home()
+    candidate_bases.extend([
+        home / ".gemini" / "antigravity-cli" / "brain",
+        home / ".gemini" / "antigravity" / "brain",
+    ])
+
+    # 2. Path standar VPS Linux (/home/ubuntu)
+    candidate_bases.extend([
+        Path("/home/ubuntu/.gemini/antigravity-cli/brain"),
+        Path("/home/ubuntu/.gemini/antigravity/brain"),
+    ])
+
+    # 3. Path dari workspace jika ada folder brain
+    candidate_bases.append(Path(WORKSPACE_DIR) / ".gemini" / "brain")
+
+    # Filter direktori basis yang valid dan ada di filesystem
+    valid_bases = [b for b in candidate_bases if b.is_dir()]
+
+    if conv_id:
+        for base in valid_bases:
+            cand = base / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+            if cand.is_file():
+                return cand, conv_id
+        return None, conv_id
+
+    # Jika conv_id is None (sesi baru yang hang sebelum ID tercatat), cari direktori termutakhir
+    newest_file: Optional[Path] = None
+    newest_mtime = -1.0
+    found_conv_id: Optional[str] = None
+
+    for base in valid_bases:
+        try:
+            for item in base.iterdir():
+                if item.is_dir():
+                    cand = item / ".system_generated" / "logs" / "transcript.jsonl"
+                    if cand.is_file():
+                        mtime = cand.stat().st_mtime
+                        if mtime > newest_mtime:
+                            newest_mtime = mtime
+                            newest_file = cand
+                            found_conv_id = item.name
+        except Exception as e:
+            logger.warning(f"Gagal memeriksa direktori brain {base}: {e}")
+
+    if newest_file and found_conv_id:
+        return newest_file, found_conv_id
+
+    return None, None
+
+
+def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Membaca jawaban terakhir model AI dari transcript.jsonl jika subprocess agy hang/timeout.
+    Dilengkapi Anti-Stale Turn Protection: jika menemukan USER_INPUT sebelum PLANNER_RESPONSE,
+    berarti model belum merespons giliran ini (hindari mengembalikan jawaban basi dari turn sebelumnya).
+    Mengembalikan tuple: (recovered_text, actual_conv_id).
+    """
+    transcript_path, resolved_conv_id = get_transcript_path(conv_id)
+    if not transcript_path or not transcript_path.is_file():
+        return None, resolved_conv_id
+
+    try:
+        content = transcript_path.read_text(encoding="utf-8", errors="replace")
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+
+        for line in reversed(lines):
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+
+            # Anti-Stale Turn Protection: Jika menabrak giliran USER_INPUT terbaru sebelum ada PLANNER_RESPONSE bertarget,
+            # berarti giliran saat ini belum sempat menghasilkan teks balasan.
+            if data.get("source") in ("USER_EXPLICIT", "USER") and data.get("type") == "USER_INPUT":
+                logger.info(
+                    f"Menemukan USER_INPUT sebelum PLANNER_RESPONSE di transkrip ({transcript_path}). "
+                    f"Tidak ada balasan baru untuk giliran ini."
+                )
+                break
+
+            if (
+                data.get("source") == "MODEL"
+                and data.get("type") == "PLANNER_RESPONSE"
+                and data.get("status") == "DONE"
+                and data.get("content")
+            ):
+                recovered_content = str(data["content"]).strip()
+                if recovered_content:
+                    logger.info(
+                        f"Berhasil me-recover balasan model ({len(recovered_content)} karakter) "
+                        f"dari {transcript_path} (Conv: {resolved_conv_id})"
+                    )
+                    return recovered_content, resolved_conv_id
+
+    except Exception as e:
+        logger.error(f"Gagal membaca fallback transcript dari {transcript_path}: {e}")
+
+    return None, resolved_conv_id
+
+
+# ==============================================================================
 # SUBPROCESS AGY CLI RUNNER
 # ==============================================================================
 async def run_agy_cli(
@@ -512,6 +646,7 @@ async def run_agy_cli(
     """
     Mengeksekusi binary agy CLI sebagai asinkron subprocess.
     Menggunakan --output-format json untuk mengekstrak conversation_id resmi & respons teks.
+    Dilengkapi timeout protection & fallback transcript recovery.
     Mengembalikan tuple: (response_text, new_or_existing_conv_id).
     """
     if not os.path.exists(AGY_BIN_PATH) and not shutil.which(AGY_BIN_PATH):
@@ -524,8 +659,12 @@ async def run_agy_cli(
     if conv_id:
         cmd.extend(["--conversation", conv_id])
 
+    # Sisipkan instruksi sistem headless VPS pada prompt
+    full_prompt = build_cli_prompt(prompt)
+
     cmd.extend([
-        "-p", prompt,
+        "-p", full_prompt,
+        "--print-timeout", f"{AGY_TIMEOUT_SECONDS}s",
         "--dangerously-skip-permissions",
         "--output-format", "json"
     ])
@@ -539,7 +678,10 @@ async def run_agy_cli(
     ]
     env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "")])
 
-    logger.info(f"Menjalankan subprocess agy untuk user {user_id} (Conv: {conv_id or 'Baru'})...")
+    logger.info(
+        f"Menjalankan subprocess agy untuk user {user_id} "
+        f"(Conv: {conv_id or 'Baru'}, Timeout: {AGY_TIMEOUT_SECONDS}s)..."
+    )
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -549,11 +691,55 @@ async def run_agy_cli(
     )
 
     user_processes[user_id] = proc
+    stdout_bytes = b""
+    stderr_bytes = b""
+    timed_out = False
 
     try:
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        # Berikan buffer toleransi 10 detik di atas print-timeout agar agy sempat menyelesaikan output formatting
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=float(AGY_TIMEOUT_SECONDS + 10)
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        logger.warning(
+            f"Proses agy untuk user {user_id} (PID: {proc.pid if hasattr(proc, 'pid') else 'unknown'}) "
+            f"melebihi batas waktu ({AGY_TIMEOUT_SECONDS}s). Menghentikan subprocess..."
+        )
+        try:
+            res = proc.terminate()
+            if asyncio.iscoroutine(res):
+                await res
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except (asyncio.TimeoutError, Exception):
+            try:
+                k_res = proc.kill()
+                if asyncio.iscoroutine(k_res):
+                    await k_res
+            except Exception:
+                pass
     finally:
         user_processes.pop(user_id, None)
+
+    if timed_out:
+        # Fallback Robust: Cek apakah model AI sebenarnya sudah menuliskan balasan di transcript.jsonl
+        recovered_text, found_conv_id = recover_last_response_from_transcript(conv_id)
+        effective_conv = found_conv_id or conv_id
+        if recovered_text:
+            return (
+                f"{recovered_text}\n\n"
+                f"⏱️ <i>(Catatan: Subprocess agy melebihi batas waktu {AGY_TIMEOUT_SECONDS} detik dan dihentikan, "
+                f"namun jawaban berhasil dipulihkan dari log transkrip sistem.)</i>",
+                effective_conv
+            )
+
+        return (
+            f"⏱️ **Waktu eksekusi habis (Timeout {AGY_TIMEOUT_SECONDS} detik).**\n"
+            f"Subprocess Antigravity telah dihentikan secara aman demi kestabilan sistem.\n\n"
+            f"💡 *Jika tugas memerlukan waktu lebih lama, Anda dapat memperbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`.*",
+            effective_conv
+        )
 
     stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -597,6 +783,7 @@ async def run_agy_cli(
         return f"⚠️ Output (stderr):\n```text\n{stderr_text}\n```", conv_id
 
     return "(agy menyelesaikan tugas tanpa balasan output teks)", conv_id
+
 
 # ==============================================================================
 # MODEL QUOTA & USAGE UTILITIES
@@ -919,6 +1106,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• **Workspace Path**: `{WORKSPACE_DIR}`\n"
         f"• **Approval Mode**: `{APPROVAL_MODE}`\n"
         f"• **Approval Timeout**: `{APPROVAL_TIMEOUT_SECONDS} detik`\n"
+        f"• **Execution Timeout**: `{AGY_TIMEOUT_SECONDS} detik`\n"
         f"• **Sesi Percakapan**: `{current_conv if current_conv else 'Belum ada (Fresh)'}`\n"
         f"• **Status Tugas Saat Ini**: `{'⏳ Sedang Berjalan (PID: ' + str(running_proc.pid) + ')' if is_proc_running else '💤 Idle'}`\n"
         f"• **Whitelist User ID**: `{user_id}` (Terverifikasi)\n"

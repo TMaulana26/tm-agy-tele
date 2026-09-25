@@ -25,6 +25,7 @@ Dilengkapi sistem **Interactive Approval (ala Hermes Agent)** untuk meminta konf
   - **Inline Keyboard Confirmation**: Menampilkan tombol `[ ✅ Setujui (Approve) ]` dan `[ ❌ Tolak (Deny) ]` untuk aksi berisiko tinggi.
   - **Fail-Closed Timeout**: Eksekusi dibatalkan otomatis jika tombol tidak ditekan dalam batas waktu (default: 120 detik).
 - 🛑 **Real Process Interruption (`/cancel`)**: Menghentikan proses `agy` yang sedang berjalan di sistem host secara instan (`SIGTERM`/`SIGKILL`).
+- ⏱️ **Subprocess Hang Resilience & Fallback Recovery**: Batas waktu eksekusi (`AGY_TIMEOUT_SECONDS=180`) untuk subprocess `agy`, dilengkapi pembatalan aman (`SIGTERM`/`SIGKILL`) dan pemulihan otomatis jawaban model dari transkrip lokal (`transcript.jsonl`) jika pipe subprocess tertahan.
 - 📊 **Real-Time Quota & Usage Monitor (`/usage` & `/limit`)**: Mengekstrak data kuota akun Antigravity (Gemini, Claude, GPT), visual progress bar, persentase kuota, dan sisa waktu refresh langsung dari `agy` CLI tanpa memakan token LLM.
 - 📁 **Native Media & File Delivery**: Mendeteksi sintaks `MEDIA:/path/ke/file` pada output `agy` dan otomatis mengirimkannya sebagai dokumen Telegram (`send_document`).
 - ⏳ **Live Timer Feedback & Typing**: Indikator pengetikan berkala dan pembaruan timer detik berjalan selama proses berlangsung.
@@ -36,6 +37,7 @@ Dilengkapi sistem **Interactive Approval (ala Hermes Agent)** untuk meminta konf
 
 ```text
 tm-agy-tele/
+├── AGENTS.md                 # Aturan operasional headless VPS (pencegahan schedule hang)
 ├── .env.example              # Template konfigurasi environment
 ├── .env                      # Konfigurasi aktif (diabaikan oleh git)
 ├── .gitignore                # Aturan file yang diabaikan git
