@@ -1,34 +1,31 @@
 #!/usr/bin/env python3
 """
-Antigravity Telegram Bot (Native agy CLI Subprocess Engine)
-Terintegrasi langsung dengan binary resmi agy di VPS/Host.
-
-Fitur Unggulan:
-1. Bebas API Key - Menggunakan sesi OAuth Google Antigravity bawaan (~/.gemini/antigravity-cli/)
-2. Super Hemat RAM (~35 MB) - Ideal dijalankan via systemd service di VPS
-3. Multi-turn Stateful Memory via flag `agy --conversation <CONV_ID>`
-4. Hardline Security Blocklist (Blokir total perintah katastropik: rm -rf /, forkbomb, dd, mkfs, shutdown)
-5. Hermes-Style Interactive Approval (Inline Buttons [Approve] / [Deny] dengan fail-closed timeout)
-6. Real Process Cancellation (/cancel langsung mematikan PID subprocess agy)
-7. Live Progress Feedback (Timer detik berjalan + Telegram typing status)
-8. Media & Document Dispatcher (Deteksi otomatis format MEDIA:/path/ke/file)
-9. Safe Markdown Splitter (< 4000 karakter dengan auto fallback ke teks polos)
+Antigravity Telegram Bot (Native agy CLI Subprocess Engine).
+Features full parity with Hermes Agent in Telegram:
+1. Bot API 9.5 Draft Streaming (sendMessageDraft) & In-place status updates.
+2. Bot API 9.4 Private Chat Topics (/topic) for multi-session parallel DMs.
+3. Silent Turn Pinned Indicator & Real Reactions (👀 -> 👍/👎).
+4. Interactive Model Picker (/model) using official agy models.
+5. Multi-Media Pipeline with Voice Bubble audio & strict Media Path Traversal Guard.
+6. DNS-over-HTTPS (DoH) & Host/SNI preserving fallback transport.
+7. Anti-replay update admission control.
+8. Interactive Inline Approval (Hermes Guard) & /cancel PID killing.
 """
+
+from __future__ import annotations
 
 import os
 import sys
 import re
 import json
 import time
-from datetime import datetime, timezone
-import uuid
 import html
+import uuid
 import shutil
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Set, Optional, Tuple, List
-from dotenv import load_dotenv
+from typing import Dict, Set, Optional, Tuple, List, Any
 
 from telegram import (
     Update,
@@ -48,374 +45,109 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
+# Central Configuration
+import config
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    ALLOWED_USER_IDS,
+    AGY_BIN_PATH,
+    WORKSPACE_DIR,
+    APPROVAL_MODE,
+    APPROVAL_TIMEOUT_SECONDS,
+    AGY_TIMEOUT_SECONDS,
+    DEFAULT_MODEL,
+    TELEGRAM_FALLBACK_TRANSPORT,
+    TELEGRAM_PROXY,
+    resolve_workspace_dir,
+    get_data_dir,
+    build_cli_prompt,
+)
 
-# ==============================================================================
-# LOGGING SETUP
-# ==============================================================================
+def get_upload_dir() -> Path:
+    """Memastikan dan mengembalikan direktori penyimpanan berkas unggahan Telegram (.telegram_uploads)."""
+    current_ws = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
+    upload_dir = Path(current_ws) / ".telegram_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    return upload_dir
+
+
+# Database State
+from database.state import get_db, StateDatabase
+
+# Telegram Platform Components
+from tele.network import build_resilient_request, TelegramFallbackTransport
+from tele.admission import check_update_admission, is_update_admitted
+from tele.entities import expand_link_entities, clean_bot_mentions
+from tele.media import (
+    validate_media_delivery_path,
+    extract_media_paths,
+    send_outbound_media,
+    classify_media_type,
+)
+from tele.streaming import (
+    supports_draft_streaming,
+    send_draft_stream,
+    send_or_update_status,
+    clear_status_bubble,
+    split_message,
+)
+from tele.formatters import markdown_to_telegram_html, append_duration_badge
+from tele.topics import (
+    handle_topic_command,
+    get_conversation_for_message,
+    bind_conversation_to_topic,
+    auto_rename_forum_topic,
+)
+from tele.picker import handle_model_command, handle_model_callback
+
+# Core Engine & Approval
+from core.approval import (
+    HARDLINE_BLOCKLIST,
+    DESTRUCTIVE_PATTERNS,
+    is_hardline_blocked,
+    is_destructive_prompt,
+    pending_approvals,
+    request_user_approval,
+    handle_approval_callback,
+)
+from core.usage import (
+    format_progress_bar,
+    format_relative_time,
+    format_usage_data,
+    fetch_agy_usage_report,
+    is_quota_inquiry,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("antigravity-tele-bot")
 
-# ==============================================================================
-# CONFIGURATION & ENVIRONMENT
-# ==============================================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-
-raw_allowed = os.getenv("ALLOWED_USER_ID", "0").strip()
-ALLOWED_USER_IDS: Set[int] = set()
-for part in raw_allowed.split(","):
-    part = part.strip()
-    if part.isdigit():
-        ALLOWED_USER_IDS.add(int(part))
-
-# Path binary agy di VPS atau Laptop
-AGY_BIN_PATH = os.getenv(
-    "AGY_BIN_PATH",
-    shutil.which("agy") or shutil.which("agy.exe") or "/home/ubuntu/.local/bin/agy"
-).strip()
-
-def resolve_workspace_dir() -> str:
-    """
-    Memvalidasi dan mengembalikan path direktori kerja (workspace) yang valid.
-    Jika WORKSPACE_DIR di .env tidak valid atau menunjuk ke folder yang tidak ada
-    (misalnya peninggalan '/workspace' Docker), otomatis menggunakan fallback direktori home.
-    """
-    raw = os.getenv("WORKSPACE_DIR", "").strip()
-    if raw and os.path.exists(raw) and os.path.isdir(raw):
-        return raw
-
-    # Fallback 1: Jika di Linux VPS host dan /home/ubuntu ada
-    if os.path.isdir("/home/ubuntu"):
-        if raw and raw != "/home/ubuntu":
-            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan fallback: /home/ubuntu")
-        return "/home/ubuntu"
-
-    # Fallback 2: Direktori home pengguna saat ini
-    home = Path.home()
-    if home.is_dir():
-        if raw and raw != str(home):
-            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan fallback home: {home}")
-        return str(home)
-
-    return os.getcwd()
-
-WORKSPACE_DIR = resolve_workspace_dir()
-
-def get_upload_dir() -> Path:
-    """
-    Memastikan dan mengembalikan direktori penyimpanan berkas unggahan Telegram (.telegram_uploads).
-    """
-    upload_dir = Path(WORKSPACE_DIR) / ".telegram_uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    return upload_dir
-
-APPROVAL_MODE = os.getenv("APPROVAL_MODE", "ask_destructive").strip().lower()
-APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120"))
-AGY_TIMEOUT_SECONDS = int(os.getenv("AGY_TIMEOUT_SECONDS", "180"))
-
-# ==============================================================================
-# SYSTEM INSTRUCTIONS & PROMPT BUILDER
-# ==============================================================================
-SYSTEM_INSTRUCTIONS = (
-    "Anda adalah asisten AI Antigravity yang terhubung melalui Telegram Bot di VPS Linux. "
-    f"Direktori kerja utama: {WORKSPACE_DIR}.\n\n"
-    "ATURAN OPERASIONAL PENTING:\n"
-    "1. Anda berjalan dalam sesi headless non-interaktif (print mode).\n"
-    "2. JANGAN PERNAH menggunakan tool internal `schedule` untuk recurring cron atau background timers. "
-    "Jika pengguna meminta cron job atau penjadwalan otomatis, selalu buat script dan pasang langsung ke crontab Linux host via terminal (`crontab`).\n"
-    "3. Selalu selesaikan eksekusi perintah terminal sebelum mengakhiri giliran Anda."
-)
-
-def build_cli_prompt(prompt: str) -> str:
-    """
-    Menyusun prompt pengguna dengan menyisipkan instruksi operasional headless VPS
-    agar model AI tidak menggunakan tool internal schedule dan selalu mengutamakan crontab host.
-    """
-    return f"[INSTRUKSI SISTEM]\n{SYSTEM_INSTRUCTIONS}\n\n[PERMINTAAN PENGGUNA]\n{prompt}"
-
-
-# ==============================================================================
-# STATE & REGISTRY
-# ==============================================================================
-# Menyimpan conversation_id resmi agy per user_id Telegram (Multi-turn Memory)
+# Global registries for state and cancellation
 user_conversations: Dict[int, str] = {}
-
-# Menyimpan subprocess aktif per user_id untuk keperluan pembatalan (/cancel)
 user_processes: Dict[int, asyncio.subprocess.Process] = {}
-
-# Pending approval registry:
-# { request_id: {"future": asyncio.Future, "user_id": int, "message": Message, "text": str} }
-pending_approvals: Dict[str, dict] = {}
-
-# User mutex locks & active tasks
 user_locks: Dict[int, asyncio.Lock] = {}
 user_tasks: Dict[int, asyncio.Task] = {}
 
+
 def get_user_lock(user_id: int) -> asyncio.Lock:
-    """Mendapatkan mutex lock per user untuk mencegah race condition percakapan."""
+    """Returns mutex lock per user to prevent concurrent race conditions."""
     if user_id not in user_locks:
         user_locks[user_id] = asyncio.Lock()
     return user_locks[user_id]
 
-# ==============================================================================
-# HARDLINE SECURITY BLOCKLIST & INTENT GUARD
-# ==============================================================================
-HARDLINE_BLOCKLIST = [
-    r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
-    r"mkfs(?:\.[a-z0-9]+)?\s+",
-    r"dd\s+if=.*of=/dev/(?:sd[a-z]|nvme[0-9]|hd[a-z]|vd[a-z]|mmcblk)",
-    r"fdisk\s+/dev/",
-    r">\s*/dev/(?:sd[a-z]|nvme[0-9]|hd[a-z]|vd[a-z])",
-    r"chmod\s+-[rR]\s+777\s+/(?:\s|$)",
-    r"chown\s+-[rR]\s+.*\s+/(?:\s|$)",
-    r"(?:^|[\s;&|])(?:shutdown|reboot|poweroff|halt|init\s+0)(?:$|[\s;&|])",
-    r"\brm\s+.*-(?:[a-zA-Z0-9]*[rR]|--recursive).*/(?:\*|\s|$)"
-]
-
-def is_hardline_blocked(prompt: str) -> bool:
-    """Mengecek apakah teks instruksi mengandung perintah katastropik OS."""
-    p_clean = prompt.strip()
-    for pattern in HARDLINE_BLOCKLIST:
-        if re.search(pattern, p_clean, re.IGNORECASE):
-            return True
-    return False
-
-# Pola-pola instruksi yang berpotensi mutatif/destruktif dan memerlukan Interactive Approval
-DESTRUCTIVE_PATTERNS = [
-    r"\b(?:hapus|delete|remove|unlink|shred)\b",
-    r"\brm\s+-[a-zA-Z0-9]*[rfRF]",
-    r"\b(?:drop\s+database|drop\s+table|truncate\s+table)\b",
-    r"\b(?:migrate:fresh|db:wipe)\b",
-    r"\bgit\s+(?:reset\s+--hard|clean\s+-[a-zA-Z0-9]*f|push\s+.*--force)\b",
-    r"\bdocker\s+(?:rm|rmi|system\s+prune|compose\s+down\s+-v)\b",
-    r"\b(?:kill\s+-9|pkill\s+-9|killall)\b",
-    r"\bformat\s+(?:disk|drive)\b",
-]
-
-def is_destructive_prompt(prompt: str) -> Tuple[bool, str]:
-    """
-    Mengevaluasi apakah prompt meminta tindakan berisiko tinggi.
-    Mengembalikan tuple (is_destructive: bool, reason: str).
-    """
-    if APPROVAL_MODE == "auto_approve":
-        return False, ""
-
-    prompt_low = prompt.strip().lower()
-    for pattern in DESTRUCTIVE_PATTERNS:
-        match = re.search(pattern, prompt_low)
-        if match:
-            trigger = match.group(0)
-            return True, f"Terdeteksi kata/perintah berisiko: `{trigger}`"
-
-    return False, ""
 
 # ==============================================================================
-# TELEGRAM HELPER UTILITIES
+# AUTHORIZATION & UTILITIES
 # ==============================================================================
 def is_authorized(update: Update) -> bool:
-    """Verifikasi apakah pengguna ada di whitelist ALLOWED_USER_IDS."""
+    """Verifies whether the sender is in ALLOWED_USER_IDS."""
     user = update.effective_user
     if user is None:
         return False
     return user.id in ALLOWED_USER_IDS
 
-def split_message(text: str, max_length: int = 4000) -> List[str]:
-    """
-    Memecah teks panjang secara aman agar tidak melampaui limit karakter Telegram (4096).
-    Memotong pada boundary baris baru (\n) atau spasi jika memungkinkan.
-    """
-    if not text:
-        return ["(Tidak ada output teks dari agy)"]
-    if len(text) <= max_length:
-        return [text]
-
-    chunks = []
-    while text:
-        if len(text) <= max_length:
-            chunks.append(text)
-            break
-        split_idx = text.rfind("\n", 0, max_length)
-        if split_idx == -1 or split_idx < max_length // 2:
-            split_idx = text.rfind(" ", 0, max_length)
-        if split_idx == -1 or split_idx < max_length // 2:
-            split_idx = max_length
-        chunk = text[:split_idx]
-        chunks.append(chunk)
-        text = text[split_idx:].lstrip("\r\n")
-    return chunks
-
-def markdown_to_telegram_html(text: str) -> str:
-    """
-    Mengonversi output Markdown dari AI ke format Telegram HTML yang valid dan rapi.
-    Sangat tahan banting terhadap underscore (seperti nama container Docker),
-    karakter khusus, regex, dan format heading.
-    """
-    if not text:
-        return ""
-
-    # Normalisasi line endings (CRLF -> LF) agar regex multiline konsisten di semua OS
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # 1. Simpan code blocks (```...```) agar isinya tidak terpengaruh format lain
-    code_blocks = []
-    def save_code_block(match):
-        lang = (match.group(1) or "").strip()
-        code = match.group(2)
-        idx = len(code_blocks)
-        escaped_code = html.escape(code.strip("\r\n"))
-        if lang:
-            replacement = f'<pre><code class="language-{html.escape(lang)}">{escaped_code}</code></pre>'
-        else:
-            replacement = f"<pre><code>{escaped_code}</code></pre>"
-        code_blocks.append(replacement)
-        return f"\x00CODEBLOCK{idx}\x00"
-
-    text = re.sub(r"```([a-zA-Z0-9_\+\-]*)?\n([\s\S]*?)```", save_code_block, text)
-
-    # 2. Simpan GFM pipe tables agar rapi & monospace di mobile Telegram (<pre><code>...</code></pre>)
-    table_pattern = re.compile(
-        r"(?m)^([ \t]*\|?[^\n]*\|[^\n]*\n"
-        r"[ \t]*\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*:?-+:?[ \t]*\|?[ \t]*(?:\n|\Z))"
-        r"((?:[ \t]*\|?[^\n]*\|[^\n]*(?:\n|\Z))*)"
-    )
-
-    def save_markdown_table(match):
-        raw = match.group(0)
-        has_trailing_newline = raw.endswith("\n")
-        table_raw = raw.strip("\r\n")
-        idx = len(code_blocks)
-        escaped_table = html.escape(table_raw)
-        replacement = f"<pre><code>{escaped_table}</code></pre>"
-        code_blocks.append(replacement)
-        return f"\x00CODEBLOCK{idx}\x00\n" if has_trailing_newline else f"\x00CODEBLOCK{idx}\x00"
-
-    text = table_pattern.sub(save_markdown_table, text)
-
-    inline_codes = []
-
-    # 3. Simpan link file:/// lokal SEBELUM inline code agar nested backtick [`file`](file:///...) tidak konflik
-    def clean_file_link(match):
-        raw_label = match.group(1).strip()
-        label = raw_label.strip("`").strip()
-        idx = len(inline_codes)
-        escaped_label = html.escape(label)
-        inline_codes.append(f"<code>{escaped_label}</code>")
-        return f"\x00INLINECODE{idx}\x00"
-
-    text = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", clean_file_link, text)
-
-    # 4. Simpan tautan web standar [label](https://...) SEBELUM inline code
-    def save_web_link(match):
-        raw_label = match.group(1).strip()
-        has_code = raw_label.startswith("`") and raw_label.endswith("`")
-        label = raw_label.strip("`").strip()
-        url = match.group(2).strip()
-        idx = len(inline_codes)
-        escaped_label = html.escape(label)
-        escaped_url = html.escape(url, quote=True)
-        if has_code:
-            replacement = f'<a href="{escaped_url}"><code>{escaped_label}</code></a>'
-        else:
-            replacement = f'<a href="{escaped_url}">{escaped_label}</a>'
-        inline_codes.append(replacement)
-        return f"\x00INLINECODE{idx}\x00"
-
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", save_web_link, text)
-
-    # 5. Simpan inline code standar (`...`)
-    def save_inline_code(match):
-        code = match.group(1)
-        idx = len(inline_codes)
-        escaped_code = html.escape(code)
-        inline_codes.append(f"<code>{escaped_code}</code>")
-        return f"\x00INLINECODE{idx}\x00"
-
-    text = re.sub(r"`([^`\n]+)`", save_inline_code, text)
-
-    # 6. Tangkap tag <code>...</code> mentah yang ditulis langsung tanpa backtick
-    def preserve_raw_code_tag(match):
-        content = match.group(1)
-        idx = len(inline_codes)
-        escaped_content = html.escape(content)
-        inline_codes.append(f"<code>{escaped_content}</code>")
-        return f"\x00INLINECODE{idx}\x00"
-
-    text = re.sub(r"<code>([\s\S]*?)</code>", preserve_raw_code_tag, text, flags=re.IGNORECASE)
-
-    # 7. Escape HTML pada sisa teks biasa (&, <, >)
-    text = html.escape(text)
-
-    # 8. Format headers (###, ##, #) menjadi bold tanpa tanda pagar dan tanpa double **
-    def format_header(match):
-        content = match.group(1).strip()
-        clean_content = re.sub(r"\*\*(.*?)\*\*", r"\1", content)
-        return f"<b>{clean_content}</b>"
-
-    text = re.sub(r"(?m)^#{1,6}\s*(.*?)$", format_header, text)
-
-    # 9. Format garis pembatas horizontal (---, ***, ___) menjadi garis tipis elegan Telegram
-    text = re.sub(r"(?m)^[ \t]*([*\-_~]){3,}[ \t]*$", r"───────────────", text)
-
-    # 10. Format bullet points (* atau - di awal baris, termasuk ber-indentasi spasi/tab) menjadi simbol bullet rapi (• )
-    text = re.sub(r"(?m)^([ \t]*)[\*\-]\s+", r"\1• ", text)
-
-    # 11. Format bold (**text** atau __text__) -> <b>text</b>
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
-
-    # 12. Format italic (*text* atau _text_)
-    text = re.sub(r"(?<!\w)\*([^\*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!\w)_([^_\n]+?)_(?!\w)", r"<i>\1</i>", text)
-
-    # 13. Format blockquote berturut-turut (> text) menjadi satu <blockquote>...</blockquote>
-    def format_contiguous_blockquotes(match):
-        block = match.group(0)
-        lines = []
-        for line in block.splitlines():
-            cleaned = re.sub(r"^&gt;\s?", "", line).strip()
-            lines.append(cleaned)
-        content = "\n".join(lines).strip()
-
-        # Konversi GitHub-style alerts ([!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION])
-        alert_map = {
-            "[!NOTE]": "💡 <b>Catatan:</b>\n",
-            "[!TIP]": "💡 <b>Tips:</b>\n",
-            "[!IMPORTANT]": "📌 <b>Penting:</b>\n",
-            "[!WARNING]": "⚠️ <b>Peringatan:</b>\n",
-            "[!CAUTION]": "🛑 <b>Perhatian:</b>\n",
-        }
-        for tag, header in alert_map.items():
-            if content.startswith(tag):
-                content = header + content[len(tag):].lstrip()
-                break
-
-        return f"<blockquote>{content}</blockquote>\n"
-
-    text = re.sub(r"(?m)(?:^&gt;.*$\n?)+", format_contiguous_blockquotes, text)
-
-    # 14. Kembalikan inline codes dan code blocks secara multi-pass agar tidak ada marker tersisa
-    for _ in range(5):
-        replaced = False
-        for idx, replacement in enumerate(inline_codes):
-            marker = f"\x00INLINECODE{idx}\x00"
-            if marker in text:
-                text = text.replace(marker, replacement)
-                replaced = True
-        for idx, replacement in enumerate(code_blocks):
-            marker = f"\x00CODEBLOCK{idx}\x00"
-            if marker in text:
-                text = text.replace(marker, replacement)
-                replaced = True
-        if not replaced:
-            break
-
-    # Sanitasi darurat: jika masih ada placeholder yang bocor karena alasan anomali, bersihkan
-    text = re.sub(r"\x00?(?:INLINECODE|CODEBLOCK)\d+\x00?", "", text)
-
-    return text.strip()
 
 async def safe_send_message(
     bot,
@@ -424,36 +156,40 @@ async def safe_send_message(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: Optional[str] = ParseMode.HTML,
     disable_notification: bool = False,
-    reply_to_message_id: Optional[int] = None
+    reply_to_message_id: Optional[int] = None,
+    message_thread_id: Optional[int] = None
 ) -> Optional[Message]:
     """
-    Mengirim pesan Telegram dengan fallback otomatis ke teks polos jika parsing HTML/Markdown gagal.
-    Mendukung silent notification (disable_notification) dan quote reply anchoring (reply_to_message_id).
+    Safely sends a message to Telegram with automatic fallback to plain text.
+    Handles stale reply targets and missing thread anchors gracefully.
     """
+    effective_thread = message_thread_id if isinstance(message_thread_id, int) else None
+    effective_reply = reply_to_message_id if isinstance(reply_to_message_id, int) else None
+
+    send_kwargs: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_markup,
+        "parse_mode": parse_mode,
+        "disable_notification": disable_notification,
+    }
+    if effective_reply is not None:
+        send_kwargs["reply_to_message_id"] = effective_reply
+    if effective_thread is not None:
+        send_kwargs["message_thread_id"] = effective_thread
+
     try:
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-            disable_notification=disable_notification,
-            reply_to_message_id=reply_to_message_id
-        )
+        return await bot.send_message(**send_kwargs)
     except BadRequest as e:
         err_str = str(e).lower()
-        effective_reply_to = reply_to_message_id
 
-        # 1. Jika error karena reply target tidak ditemukan/dihapus, coba kirim ulang dengan formatting utuh
-        if "repl" in err_str and effective_reply_to is not None:
-            logger.warning(f"Reply target {effective_reply_to} tidak valid ({e}). Mengirim ulang tanpa reply_to...")
+        # 1. If error because reply target invalid, retry with formatting but without reply_to
+        if "repl" in err_str and effective_reply is not None:
+            logger.warning(f"Reply target {effective_reply} tidak valid ({e}). Mengirim ulang tanpa reply_to...")
+            retry_kwargs = dict(send_kwargs)
+            retry_kwargs.pop("reply_to_message_id", None)
             try:
-                return await bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                    disable_notification=disable_notification
-                )
+                return await bot.send_message(**retry_kwargs)
             except BadRequest as e_retry:
                 e = e_retry
                 err_str = str(e).lower()
@@ -461,29 +197,23 @@ async def safe_send_message(
                 logger.error(f"Gagal mengirim ulang pesan: {e_retry}")
                 return None
 
-        # 2. Fallback ke teks polos jika formatting invalid atau pengiriman sebelumnya gagal
+        # 2. Fallback to plain text if formatting error occurred
         logger.warning(f"Error saat send_message ({e}). Mengirim ulang sebagai plain text...")
-        target_reply = effective_reply_to if "repl" not in err_str else None
+        target_reply = effective_reply if "repl" not in err_str else None
+        plain_kwargs = dict(send_kwargs)
+        plain_kwargs["parse_mode"] = None
+        if target_reply is not None:
+            plain_kwargs["reply_to_message_id"] = target_reply
+        else:
+            plain_kwargs.pop("reply_to_message_id", None)
+
         try:
-            return await bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=None,
-                disable_notification=disable_notification,
-                reply_to_message_id=target_reply
-            )
+            return await bot.send_message(**plain_kwargs)
         except BadRequest as e2:
-            if "repl" in str(e2).lower() and target_reply is not None:
-                # Jika pesan yang di-reply sudah dihapus pengguna saat retry plain text
+            if "repl" in str(e2).lower() and "reply_to_message_id" in plain_kwargs:
+                plain_kwargs.pop("reply_to_message_id", None)
                 try:
-                    return await bot.send_message(
-                        chat_id=chat_id,
-                        text=text,
-                        reply_markup=reply_markup,
-                        parse_mode=None,
-                        disable_notification=disable_notification
-                    )
+                    return await bot.send_message(**plain_kwargs)
                 except Exception:
                     pass
             logger.error(f"Gagal total mengirim pesan plain text: {e2}")
@@ -492,8 +222,9 @@ async def safe_send_message(
             logger.error(f"Gagal total mengirim pesan plain text: {e2}")
             return None
     except Exception as e:
-        logger.error(f"Error tidak terduga di safe_send_message: {e}")
+        logger.error(f"Unexpected error in safe_send_message: {e}")
         return None
+
 
 async def safe_edit_message(
     msg: Message,
@@ -501,9 +232,7 @@ async def safe_edit_message(
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: Optional[str] = ParseMode.HTML
 ) -> bool:
-    """
-    Mengedit pesan Telegram dengan fallback otomatis ke plain text jika formatting invalid.
-    """
+    """Safely edits an existing message with plain text fallback."""
     try:
         await msg.edit_text(
             text=text,
@@ -524,49 +253,29 @@ async def safe_edit_message(
             )
             return True
         except Exception as e2:
-            if "not modified" in str(e2).lower():
-                return True
-            logger.error(f"Gagal mengedit pesan plain text: {e2}")
+            logger.error(f"Gagal edit_message plain text: {e2}")
             return False
     except Exception as e:
-        if "not modified" in str(e).lower():
-            return True
         logger.error(f"Error tidak terduga di safe_edit_message: {e}")
         return False
 
-def extract_media_paths(text: str, workspace_dir: str = WORKSPACE_DIR) -> List[str]:
-    """
-    Mendeteksi sintaks MEDIA:/path/ke/file atau [MEDIA: /path/ke/file] di dalam output.
-    Memvalidasi apakah file benar-benar ada di filesystem.
-    """
-    pattern = r"(?:\[MEDIA:\s*([^\]]+)\]|(?:^|\s)MEDIA:\s*([^\s\r\n]+))"
-    matches = re.findall(pattern, text, re.IGNORECASE)
-    found_paths = []
-
-    for m in matches:
-        raw_path = (m[0] or m[1]).strip().strip("\"'")
-        p = Path(raw_path)
-        if not p.is_absolute():
-            candidate = Path(workspace_dir) / raw_path
-            if candidate.exists() and candidate.is_file():
-                found_paths.append(str(candidate.resolve()))
-                continue
-        if p.exists() and p.is_file():
-            found_paths.append(str(p.resolve()))
-
-    return list(dict.fromkeys(found_paths))
 
 async def send_typing_and_progress(
     bot,
     chat_id: int,
     status_msg: Optional[Message],
-    stop_event: asyncio.Event
+    stop_event: asyncio.Event,
+    message_thread_id: Optional[int] = None
 ):
-    """Mengirim status 'typing...' dan update timer durasi setiap 4 detik."""
+    """Periodically sends typing action and updates status bubble."""
     start_time = time.time()
+    effective_thread = message_thread_id if isinstance(message_thread_id, int) else None
     while not stop_event.is_set():
         try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            kwargs = {"chat_id": chat_id, "action": ChatAction.TYPING}
+            if effective_thread is not None:
+                kwargs["message_thread_id"] = effective_thread
+            await bot.send_chat_action(**kwargs)
         except Exception:
             pass
 
@@ -578,133 +287,77 @@ async def send_typing_and_progress(
                 await safe_edit_message(
                     status_msg,
                     f"⏳ *Antigravity sedang berpikir & memproses...* `({elapsed}s)`\n"
-                    f"_Kirim /cancel untuk menghentikan proses kapan saja._"
+                    f"_Kirim /cancel untuk menghentikan proses kapan saja._",
+                    parse_mode=ParseMode.MARKDOWN
                 )
 
+
 # ==============================================================================
-# APPROVAL WORKFLOW (ALA HERMES)
+# REACTION & PIN TURN LIFECYCLE
 # ==============================================================================
-async def request_user_approval(
+async def on_turn_start(bot, chat_id: int, message_id: Optional[int]) -> None:
+    """Sets initial 'eyes' reaction and quietly pins user message during agent turn."""
+    if not isinstance(message_id, int):
+        return
+    if hasattr(bot, "set_message_reaction"):
+        try:
+            await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction="👀")
+        except Exception as e:
+            logger.debug(f"Could not set turn start reaction: {e}")
+
+    if hasattr(bot, "pin_chat_message"):
+        try:
+            await bot.pin_chat_message(chat_id=chat_id, message_id=message_id, disable_notification=True)
+        except Exception as e:
+            logger.debug(f"Could not pin message {message_id}: {e}")
+
+
+async def on_turn_complete(
     bot,
     chat_id: int,
-    user_id: int,
-    prompt: str,
-    reason: str
-) -> bool:
-    """
-    Mengirimkan Inline Keyboard konfirmasi (Approve/Deny) ke Telegram dan menunggu respons.
-    Menggunakan asyncio.Future dengan mekanisme fail-closed timeout.
-    """
-    request_id = str(uuid.uuid4())[:8]
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Setujui (Approve)", callback_data=f"appr:{request_id}"),
-            InlineKeyboardButton("❌ Tolak (Deny)", callback_data=f"deny:{request_id}")
-        ]
-    ])
-
-    pesan_approval = (
-        "⚠️ **PERMINTAAN PERSETUJUAN EKSEKUSI (Hermes Guard)**\n\n"
-        f"• **Alasan Deteksi**: {reason}\n"
-        f"• **Instruksi Akang**:\n```bash\n{prompt[:1000]}\n```\n"
-        f"⏱️ *Batas Waktu:* `{APPROVAL_TIMEOUT_SECONDS} detik (Fail-Closed)`\n\n"
-        "Apakah Akang yakin ingin mengizinkan eksekusi instruksi ini?"
-    )
-
-    msg = await safe_send_message(
-        bot=bot,
-        chat_id=chat_id,
-        text=pesan_approval,
-        reply_markup=keyboard
-    )
-
-    pending_approvals[request_id] = {
-        "future": future,
-        "user_id": user_id,
-        "message": msg,
-        "text": pesan_approval
-    }
-
-    try:
-        approved = await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_SECONDS)
-        status_label = "✅ **DISETUJUI (APPROVED)**" if approved else "❌ **DITOLAK (DENIED)**"
-        if msg:
-            await safe_edit_message(msg, f"{pesan_approval}\n\nStatus: {status_label}")
-        return approved
-    except asyncio.TimeoutError:
-        logger.warning(f"Approval request {request_id} timed out (Fail-closed).")
-        if msg:
-            await safe_edit_message(
-                msg,
-                f"{pesan_approval}\n\nStatus: ⏱️ **KADALUWARSA (TIMEOUT - DITOLAK OTOMATIS)**"
-            )
-        return False
-    except asyncio.CancelledError:
-        logger.info(f"Approval request {request_id} dibatalkan.")
-        if msg:
-            await safe_edit_message(
-                msg,
-                f"{pesan_approval}\n\nStatus: 🛑 **DIBATALKAN VIA /cancel**"
-            )
-        return False
-    finally:
-        pending_approvals.pop(request_id, None)
-
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani interaksi klik tombol Inline Keyboard Approve / Deny."""
-    query = update.callback_query
-    if query is None:
+    message_id: Optional[int],
+    success: bool = True,
+    cancelled: bool = False
+) -> None:
+    """Swaps reaction to 👍 / 👎 (or clears if cancelled) and unpins user message."""
+    if not isinstance(message_id, int):
         return
+    if hasattr(bot, "set_message_reaction"):
+        try:
+            if cancelled:
+                await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=None)
+            else:
+                final_emoji = "👍" if success else "👎"
+                await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=final_emoji)
+        except Exception as e:
+            logger.debug(f"Could not update turn complete reaction: {e}")
 
-    await query.answer()
+    if hasattr(bot, "unpin_chat_message"):
+        try:
+            await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            logger.debug(f"Could not unpin message {message_id}: {e}")
 
-    if not is_authorized(update):
-        await query.edit_message_text("⛔ Anda tidak berwenang menekan tombol ini.")
-        return
-
-    data = query.data or ""
-    action, _, request_id = data.partition(":")
-
-    if request_id in pending_approvals:
-        entry = pending_approvals[request_id]
-        future = entry.get("future")
-        if future and not future.done():
-            if action == "appr":
-                future.set_result(True)
-            elif action == "deny":
-                future.set_result(False)
 
 # ==============================================================================
-# TRANSCRIPT DISCOVERY & FALLBACK RECOVERY
+# SUBPROCESS ENGINE & TRANSCRIPT RECOVERY
 # ==============================================================================
 def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
     """
-    Mencari lokasi berkas transcript.jsonl untuk conv_id tertentu.
-    Jika conv_id adalah None, otomatis mencari sesi percakapan terbaru di folder brain.
-    Mengembalikan tuple: (transcript_path, resolved_conv_id).
+    Searches for transcript.jsonl for a given conversation ID or the newest session.
+    Reads WORKSPACE_DIR dynamically to respect runtime test patching.
     """
+    current_workspace = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
     candidate_bases: List[Path] = []
-
-    # 1. Direktori home pengguna saat ini
     home = Path.home()
     candidate_bases.extend([
         home / ".gemini" / "antigravity-cli" / "brain",
         home / ".gemini" / "antigravity" / "brain",
-    ])
-
-    # 2. Path standar VPS Linux (/home/ubuntu)
-    candidate_bases.extend([
         Path("/home/ubuntu/.gemini/antigravity-cli/brain"),
         Path("/home/ubuntu/.gemini/antigravity/brain"),
+        Path(current_workspace) / ".gemini" / "brain",
     ])
 
-    # 3. Path dari workspace jika ada folder brain
-    candidate_bases.append(Path(WORKSPACE_DIR) / ".gemini" / "brain")
-
-    # Filter direktori basis yang valid dan ada di filesystem
     valid_bases = [b for b in candidate_bases if b.is_dir()]
 
     if conv_id:
@@ -714,7 +367,6 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
                 return cand, conv_id
         return None, conv_id
 
-    # Jika conv_id is None (sesi baru yang hang sebelum ID tercatat), cari direktori termutakhir
     newest_file: Optional[Path] = None
     newest_mtime = -1.0
     found_conv_id: Optional[str] = None
@@ -731,7 +383,7 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
                             newest_file = cand
                             found_conv_id = item.name
         except Exception as e:
-            logger.warning(f"Gagal memeriksa direktori brain {base}: {e}")
+            logger.debug(f"Error checking brain dir {base}: {e}")
 
     if newest_file and found_conv_id:
         return newest_file, found_conv_id
@@ -741,82 +393,86 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
 
 def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Membaca jawaban terakhir model AI dari transcript.jsonl jika subprocess agy hang/timeout.
-    Dilengkapi Anti-Stale Turn Protection: jika menemukan USER_INPUT sebelum PLANNER_RESPONSE,
-    berarti model belum merespons giliran ini (hindari mengembalikan jawaban basi dari turn sebelumnya).
-    Mengembalikan tuple: (recovered_text, actual_conv_id).
+    Recovers the model's last response from transcript.jsonl if subprocess timed out.
+    Enforces anti-stale turn protection (checks USER_INPUT before PLANNER_RESPONSE).
     """
     transcript_path, resolved_conv_id = get_transcript_path(conv_id)
     if not transcript_path or not transcript_path.is_file():
         return None, resolved_conv_id
 
     try:
-        content = transcript_path.read_text(encoding="utf-8", errors="replace")
-        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        last_planner_content = None
+        user_input_seen_after_planner = False
 
         for line in reversed(lines):
             try:
-                data = json.loads(line)
+                entry = json.loads(line)
             except Exception:
                 continue
 
-            # Anti-Stale Turn Protection: Jika menabrak giliran USER_INPUT terbaru sebelum ada PLANNER_RESPONSE bertarget,
-            # berarti giliran saat ini belum sempat menghasilkan teks balasan.
-            if data.get("source") in ("USER_EXPLICIT", "USER") and data.get("type") == "USER_INPUT":
-                logger.info(
-                    f"Menemukan USER_INPUT sebelum PLANNER_RESPONSE di transkrip ({transcript_path}). "
-                    f"Tidak ada balasan baru untuk giliran ini."
-                )
-                break
+            entry_type = entry.get("type", "")
+            if entry_type == "USER_INPUT":
+                if last_planner_content is None:
+                    user_input_seen_after_planner = True
+                    break
 
-            if (
-                data.get("source") == "MODEL"
-                and data.get("type") == "PLANNER_RESPONSE"
-                and data.get("status") == "DONE"
-                and data.get("content")
-            ):
-                recovered_content = str(data["content"]).strip()
-                if recovered_content:
-                    logger.info(
-                        f"Berhasil me-recover balasan model ({len(recovered_content)} karakter) "
-                        f"dari {transcript_path} (Conv: {resolved_conv_id})"
-                    )
-                    return recovered_content, resolved_conv_id
+            if entry_type == "PLANNER_RESPONSE" and last_planner_content is None:
+                content = entry.get("content", "").strip()
+                if content:
+                    last_planner_content = content
 
+        if user_input_seen_after_planner:
+            logger.info(
+                f"Menemukan USER_INPUT sebelum PLANNER_RESPONSE di transkrip ({transcript_path}). "
+                "Tidak ada balasan baru untuk giliran ini."
+            )
+            return None, resolved_conv_id
+
+        if last_planner_content:
+            logger.info(
+                f"Berhasil me-recover balasan model ({len(last_planner_content)} karakter) dari "
+                f"{transcript_path} (Conv: {resolved_conv_id})"
+            )
+            return last_planner_content, resolved_conv_id
+
+        return None, resolved_conv_id
     except Exception as e:
-        logger.error(f"Gagal membaca fallback transcript dari {transcript_path}: {e}")
+        logger.warning(f"Error reading transcript {transcript_path}: {e}")
+        return None, resolved_conv_id
 
-    return None, resolved_conv_id
 
-
-# ==============================================================================
-# SUBPROCESS AGY CLI RUNNER
-# ==============================================================================
 async def run_agy_cli(
     user_id: int,
     prompt: str,
     conv_id: Optional[str] = None,
-    cwd: str = WORKSPACE_DIR
+    cwd: Optional[str] = None,
+    model: Optional[str] = None
 ) -> Tuple[str, Optional[str]]:
     """
-    Mengeksekusi binary agy CLI sebagai asinkron subprocess.
-    Menggunakan --output-format json untuk mengekstrak conversation_id resmi & respons teks.
-    Dilengkapi timeout protection & fallback transcript recovery.
-    Mengembalikan tuple: (response_text, new_or_existing_conv_id).
+    Executes agy CLI as an asynchronous subprocess.
+    Extracts conversation_id and response body with timeout & transcript recovery.
+    Returns (response_text, new_or_existing_conv_id).
     """
+    effective_cwd = cwd or globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
+
     if not os.path.exists(AGY_BIN_PATH) and not shutil.which(AGY_BIN_PATH):
         raise FileNotFoundError(
-            f"Binary agy tidak ditemukan di path: '{AGY_BIN_PATH}'. "
-            f"Pastikan agy sudah terpasang atau sesuaikan variabel AGY_BIN_PATH di file .env."
+            f"Binary agy tidak ditemukan di: '{AGY_BIN_PATH}'. "
+            f"Periksa variabel AGY_BIN_PATH di file .env."
         )
 
     cmd = [AGY_BIN_PATH]
     if conv_id:
         cmd.extend(["--conversation", conv_id])
 
-    # Sisipkan instruksi sistem headless VPS pada prompt
-    full_prompt = build_cli_prompt(prompt)
+    active_model = model or DEFAULT_MODEL
+    if active_model:
+        cmd.extend(["--model", active_model])
 
+    full_prompt = build_cli_prompt(prompt)
     cmd.extend([
         "-p", full_prompt,
         "--print-timeout", f"{AGY_TIMEOUT_SECONDS}s",
@@ -825,7 +481,6 @@ async def run_agy_cli(
     ])
 
     env = os.environ.copy()
-    # Tambahkan path instalasi standar Antigravity CLI jika ada
     extra_paths = [
         "/home/ubuntu/.gemini/antigravity-cli/bin",
         "/home/ubuntu/.local/bin",
@@ -837,9 +492,10 @@ async def run_agy_cli(
         f"Menjalankan subprocess agy untuk user {user_id} "
         f"(Conv: {conv_id or 'Baru'}, Timeout: {AGY_TIMEOUT_SECONDS}s)..."
     )
+
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        cwd=cwd,
+        cwd=effective_cwd,
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
@@ -851,7 +507,6 @@ async def run_agy_cli(
     timed_out = False
 
     try:
-        # Berikan buffer toleransi 10 detik di atas print-timeout agar agy sempat menyelesaikan output formatting
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             proc.communicate(),
             timeout=float(AGY_TIMEOUT_SECONDS + 10)
@@ -867,7 +522,7 @@ async def run_agy_cli(
             if asyncio.iscoroutine(res):
                 await res
             await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except (asyncio.TimeoutError, Exception):
+        except Exception:
             try:
                 k_res = proc.kill()
                 if asyncio.iscoroutine(k_res):
@@ -878,31 +533,29 @@ async def run_agy_cli(
         user_processes.pop(user_id, None)
 
     if timed_out:
-        # Fallback Robust: Cek apakah model AI sebenarnya sudah menuliskan balasan di transcript.jsonl
-        recovered_text, found_conv_id = recover_last_response_from_transcript(conv_id)
-        effective_conv = found_conv_id or conv_id
-        if recovered_text:
+        # Check current module for mocked recover_last_response_from_transcript
+        recover_fn = getattr(sys.modules[__name__], "recover_last_response_from_transcript", recover_last_response_from_transcript)
+        recovered, found_id = recover_fn(conv_id)
+        eff_id = found_id or conv_id
+        if recovered:
             return (
-                f"{recovered_text}\n\n"
+                f"{recovered}\n\n"
                 f"⏱️ <i>(Catatan: Subprocess agy melebihi batas waktu {AGY_TIMEOUT_SECONDS} detik dan dihentikan, "
                 f"namun jawaban berhasil dipulihkan dari log transkrip sistem.)</i>",
-                effective_conv
+                eff_id
             )
-
         return (
             f"⏱️ **Waktu eksekusi habis (Timeout {AGY_TIMEOUT_SECONDS} detik).**\n"
             f"Subprocess Antigravity telah dihentikan secara aman demi kestabilan sistem.\n\n"
             f"💡 *Jika tugas memerlukan waktu lebih lama, Anda dapat memperbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`.*",
-            effective_conv
+            eff_id
         )
 
     stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
-    # Coba parsing output sebagai JSON terstruktur
     parsed_json = None
     if stdout_text:
-        # Beberapa output CLI mungkin memiliki warning sebelum baris JSON
         for line in stdout_text.splitlines():
             line_str = line.strip()
             if line_str.startswith("{") and line_str.endswith("}"):
@@ -918,20 +571,18 @@ async def run_agy_cli(
                 pass
 
     if parsed_json and isinstance(parsed_json, dict):
-        returned_conv_id = parsed_json.get("conversation_id") or conv_id
-        response_body = parsed_json.get("response", "").strip()
+        ret_conv = parsed_json.get("conversation_id") or conv_id
+        resp = parsed_json.get("response", "").strip()
         status = parsed_json.get("status", "")
-        error_msg = parsed_json.get("error", "").strip()
+        err = parsed_json.get("error", "").strip()
 
-        if status == "ERROR" and error_msg:
-            return f"❌ **Error dari agy:**\n```text\n{error_msg}\n```", returned_conv_id
+        if status == "ERROR" and err:
+            return f"❌ **Error dari agy:**\n```text\n{err}\n```", ret_conv
+        if resp:
+            return resp, ret_conv
+        elif err:
+            return f"⚠️ **Output agy:**\n```text\n{err}\n```", ret_conv
 
-        if response_body:
-            return response_body, returned_conv_id
-        elif error_msg:
-            return f"⚠️ **Output agy:**\n```text\n{error_msg}\n```", returned_conv_id
-
-    # Fallback jika CLI menghasilkan output teks biasa
     if stdout_text:
         return stdout_text, conv_id
     elif stderr_text:
@@ -941,252 +592,27 @@ async def run_agy_cli(
 
 
 # ==============================================================================
-# MODEL QUOTA & USAGE UTILITIES
-# ==============================================================================
-def format_progress_bar(fraction: float, length: int = 10) -> str:
-    """Membuat visual progress bar terminal-style: [████████░░] 78.5%"""
-    fraction = max(0.0, min(1.0, fraction))
-    filled = int(round(fraction * length))
-    empty = length - filled
-    return f"[{'█' * filled}{'░' * empty}] {fraction * 100:.1f}%"
-
-
-def format_relative_time(reset_time_iso: str) -> str:
-    """Mengubah timestamp ISO UTC menjadi format sisa waktu relatif yang ramah."""
-    if not reset_time_iso:
-        return ""
-    try:
-        clean_iso = reset_time_iso.replace("Z", "+00:00")
-        target_dt = datetime.fromisoformat(clean_iso)
-        now_utc = datetime.now(timezone.utc)
-        diff = target_dt - now_utc
-
-        total_seconds = int(diff.total_seconds())
-        if total_seconds <= 0:
-            return "Quota available"
-
-        days = total_seconds // 86400
-        hours = (total_seconds % 86400) // 3600
-        minutes = (total_seconds % 3600) // 60
-
-        parts = []
-        if days > 0:
-            parts.append(f"{days}d")
-        if hours > 0:
-            parts.append(f"{hours}h")
-        if minutes > 0 and days == 0:
-            parts.append(f"{minutes}m")
-
-        time_str = " ".join(parts) if parts else "< 1m"
-        return f"Refreshes in {time_str}"
-    except Exception:
-        return reset_time_iso
-
-
-def format_usage_data(raw_output: str) -> str:
-    """
-    Memformat output JSON atau teks dari 'agy -p /usage' menjadi pesan Telegram HTML yang rapi.
-    """
-    if not raw_output or not raw_output.strip():
-        return "⚠️ Tidak ada data kuota yang diterima dari Antigravity CLI."
-
-    parsed = None
-    for line in raw_output.splitlines():
-        line_str = line.strip()
-        if line_str.startswith("{") and line_str.endswith("}"):
-            try:
-                parsed = json.loads(line_str)
-                break
-            except Exception:
-                continue
-
-    if not parsed:
-        try:
-            parsed = json.loads(raw_output)
-        except Exception:
-            pass
-
-    if parsed and isinstance(parsed, dict):
-        cmd_data = parsed.get("command", {}).get("data", {})
-        groups = cmd_data.get("groups", [])
-        if groups:
-            lines = [
-                "📊 <b>Models &amp; Quota (Antigravity CLI)</b>",
-                "━━━━━━━━━━━━━━━━━━━━"
-            ]
-
-            group_icons = {
-                "gemini": "🤖",
-                "claude": "🔮",
-            }
-
-            for group in groups:
-                g_name = group.get("name", "Model Group")
-                g_desc = group.get("description", "")
-
-                icon = "✨"
-                for k, ic in group_icons.items():
-                    if k in g_name.lower():
-                        icon = ic
-                        break
-
-                lines.append(f"\n{icon} <b>{html.escape(g_name.upper())}</b>")
-                if g_desc:
-                    lines.append(f"<i>{html.escape(g_desc)}</i>")
-
-                buckets = group.get("buckets", [])
-                for bucket in buckets:
-                    b_name = bucket.get("name", "Limit")
-                    fraction = float(bucket.get("remaining_fraction", 1.0))
-                    reset_time = bucket.get("reset_time", "")
-
-                    bar = format_progress_bar(fraction)
-                    rel_time = format_relative_time(reset_time) if fraction < 0.999 else "Quota available"
-
-                    status_icon = "🟢" if fraction > 0.5 else ("🟡" if fraction > 0.2 else "🔴")
-                    time_icon = "⏱" if fraction < 0.999 else "✅"
-
-                    lines.append(f"\n• {status_icon} <b>{html.escape(b_name)}</b>")
-                    lines.append(f"  <code>{bar}</code>")
-                    lines.append(f"  {time_icon} <i>{html.escape(rel_time)}</i>")
-
-            lines.append("\n━━━━━━━━━━━━━━━━━━━━")
-            lines.append("💡 <i>Model Flash mengonsumsi kuota lebih hemat dan memiliki limit lebih tinggi.</i>")
-            return "\n".join(lines)
-
-    # Fallback TSV atau teks biasa
-    lines = [
-        "📊 <b>Models &amp; Quota (Antigravity CLI)</b>",
-        "━━━━━━━━━━━━━━━━━━━━"
-    ]
-    has_content = False
-    for line in raw_output.splitlines():
-        parts = [p.strip() for p in line.split("\t") if p.strip()]
-        if len(parts) >= 3:
-            grp = parts[0]
-            limit_name = parts[1]
-            pct = parts[2]
-            extra = f" (Refreshes: {parts[3]})" if len(parts) >= 4 else ""
-            lines.append(f"• <b>{html.escape(grp)}</b> - {html.escape(limit_name)}: <code>{html.escape(pct)}</code>{html.escape(extra)}")
-            has_content = True
-        elif line.strip() and not line.strip().startswith("{"):
-            lines.append(html.escape(line.strip()))
-            has_content = True
-
-    if not has_content:
-        return f"📊 <b>Output Kuota:</b>\n<pre>{html.escape(raw_output[:1000])}</pre>"
-
-    return "\n".join(lines)
-
-
-async def fetch_agy_usage_report() -> str:
-    """
-    Menjalankan 'agy -p "/usage" --output-format json' via subprocess
-    dan memformat hasilnya menjadi laporan kuota Telegram yang rapi.
-    """
-    if not os.path.exists(AGY_BIN_PATH) and not shutil.which(AGY_BIN_PATH):
-        return (
-            "❌ <b>Binary agy tidak ditemukan di sistem!</b>\n"
-            f"Path: <code>{html.escape(AGY_BIN_PATH)}</code>\n"
-            "Pastikan binary agy sudah terpasang dan path diatur dengan benar di .env."
-        )
-
-    cmd = [
-        AGY_BIN_PATH,
-        "-p", "/usage",
-        "--output-format", "json"
-    ]
-
-    env = os.environ.copy()
-    extra_paths = [
-        "/home/ubuntu/.gemini/antigravity-cli/bin",
-        "/home/ubuntu/.local/bin",
-        "/usr/local/bin"
-    ]
-    env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "")])
-
-    logger.info("Mengambil data kuota model via 'agy -p /usage'...")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=WORKSPACE_DIR,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return "⚠️ <b>Timeout:</b> Gagal mengambil data kuota dari agy CLI dalam 30 detik."
-    except Exception as e:
-        logger.error(f"Error menjalankan subprocess agy usage: {e}", exc_info=True)
-        return f"❌ <b>Error eksekusi agy:</b>\n<code>{html.escape(str(e))}</code>"
-
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-    return format_usage_data(stdout_text)
-
-
-def is_quota_inquiry(text: str) -> bool:
-    """
-    Mendeteksi apakah pesan pengguna menanyakan kuota/limit akun Antigravity,
-    bukan instruksi koding (seperti 'SELECT * ... LIMIT 10' atau 'set rate limit').
-    """
-    clean = text.strip().lower()
-    if not clean:
-        return False
-
-    # Perintah langsung
-    if clean in ("/usage", "/limit", "usage", "limit", "kuota", "quota"):
-        return True
-
-    # Frasa langsung yang sering ditanyakan user
-    direct_phrases = [
-        "usage limit", "sisa limit", "sisa kuota", "kuota sisa", "limit sisa",
-        "cek kuota", "cek limit", "cek usage", "status kuota", "status limit",
-        "kuota agy", "limit agy", "limit akun", "kuota akun", "quota limit",
-        "remaining quota", "remaining limit", "quota remaining", "usage remaining",
-        "kuota model", "limit model"
-    ]
-    for phrase in direct_phrases:
-        if phrase in clean:
-            # Pastikan bukan query database seperti SELECT ... LIMIT
-            if not re.search(r"\bselect\b.*\blimit\b", clean):
-                return True
-
-    # Pola kombinasi: kata tanya/cek/sisa + kata kuota/limit/usage
-    has_inquiry_word = bool(re.search(r"\b(sisa|berapa|cek|check|info|status|lihat|tampilkan|ada|habis|kurang)\b", clean))
-    has_quota_word = bool(re.search(r"\b(kuota|quota|limit|usage)\b", clean))
-
-    # Abaikan jika ada indikasi instruksi pemrograman teknis
-    is_coding = bool(re.search(
-        r"\b(sql|query|table|database|mysql|postgres|select|css|div|width|height|rate[\s_-]?limit|pagination|offset)\b",
-        clean
-    ))
-
-    if has_inquiry_word and has_quota_word and not is_coding:
-        return True
-
-    return False
-
-# ==============================================================================
-# TELEGRAM COMMAND HANDLERS
+# COMMAND HANDLERS
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
-        await update.message.reply_text("⛔ Akses ditolak. Bot ini privat untuk pemilik sistem.")
+        user_id = update.effective_user.id if update.effective_user else "Unknown"
+        logger.warning(f"Akses ditolak untuk User ID: {user_id}")
+        await update.message.reply_text(
+            f"⛔ <b>Akses Ditolak!</b>\n\n"
+            f"ID Telegram Anda: <code>{user_id}</code>\n"
+            f"Akun Anda belum terdaftar di whitelist bot.",
+            parse_mode=ParseMode.HTML
+        )
         return
-
-    user_id = update.effective_user.id
-    current_conv = user_conversations.get(user_id, "Belum dimulai (Akan dibuat saat pesan pertama)")
 
     welcome_text = (
         "🤖 **Halo Kang! Antigravity Telegram Bot Aktif.**\n\n"
         "Bot ini terhubung langsung ke **Native `agy` CLI Engine** di VPS/Host dengan sesi login Google Antigravity Akang.\n"
         "Dilengkapi fitur **Hermes Guard (Interactive Approval)** untuk mencegah eksekusi instruksi katastropik.\n\n"
         "**Perintah Tersedia:**\n"
+        "• `/model`  - Pilih model AI aktif (Gemini 3.8 Flash, Claude Sonnet 4.6, dll)\n"
+        "• `/topic`  - Buka mode Multi-Session DM (Private Forum Topics)\n"
         "• `/usage`  - Cek kuota & sisa limit model (Gemini, Claude, GPT)\n"
         "• `/status` - Cek engine, memory ID, workspace, dan status proses\n"
         "• `/cancel` - Hentikan paksa proses `agy` yang sedang berjalan\n"
@@ -1194,7 +620,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/help`   - Panduan lengkap fitur & media transfer\n\n"
         "Silakan kirim pesan atau instruksi koding/perintah apa pun langsung di sini."
     )
-    await safe_send_message(context.bot, update.effective_chat.id, welcome_text)
+    await safe_send_message(context.bot, update.effective_chat.id, welcome_text, parse_mode=ParseMode.MARKDOWN)
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
@@ -1203,53 +630,72 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📖 **Panduan Penggunaan Antigravity Telegram Bot**\n\n"
         "**1. Perintah Bot:**\n"
+        "• `/model`  : Memilih model AI aktif (Gemini 3.8 Flash, Claude Sonnet 4.6, dll).\n"
+        "• `/topic`  : Membuka mode Multi-Session DM (Private Forum Topics ala Hermes).\n"
         "• `/usage`  : Menampilkan sisa kuota dan waktu refresh limit model secara real-time.\n"
         "• `/status` : Informasi engine, binary path, memori multi-turn, dan PID proses.\n"
         "• `/cancel` : Mematikan proses `agy` yang sedang berjalan secara instan (`SIGTERM`/`SIGKILL`).\n"
-        "• `/reset`  : Menghapus `conversation_id` dan memulai sesi baru yang segar.\n\n"
+        "• `/reset`  : Menghapus sesi aktif dan memulai percakapan baru.\n\n"
         "**2. Keamanan & Approval (Ala Hermes):**\n"
-        "• Perintah berisiko tinggi (hapus database, drop table, rm -rf, git push force) akan memunculkan tombol "
-        "`[ ✅ Approve ]` dan `[ ❌ Deny ]`.\n"
-        "• Batas waktu approval adalah 120 detik (otomatis dibatalkan jika tidak direspons).\n"
-        "• Perintah katastropik OS (`rm -rf /`, `mkfs`, `dd`, `shutdown`) **DIBLOKIR TOTAL** tanpa konfirmasi.\n\n"
+        "• Perintah berisiko tinggi (hapus database, drop table, rm -rf, git force) memunculkan tombol konfirmasi.\n"
+        "• Perintah katastropik OS (`rm -rf /`, `mkfs`, `dd`, `shutdown`) **DIBLOKIR TOTAL**.\n\n"
         "**3. Pengiriman Berkas & Media:**\n"
-        "Jika hasil pekerjaan menghasilkan berkas gambar/dokumen, bot akan otomatis mengirimkannya ke chat Telegram pengguna."
+        "Kirim dokumen, foto, atau suara langsung ke chat. Hasil file dari model otomatis dikirim kembali."
     )
-    await safe_send_message(context.bot, update.effective_chat.id, help_text)
+    await safe_send_message(context.bot, update.effective_chat.id, help_text, parse_mode=ParseMode.MARKDOWN)
+
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk perintah /usage dan /limit."""
     if not is_authorized(update):
         return
 
     chat_id = update.effective_chat.id
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
+
     status_msg = await safe_send_message(
         context.bot,
         chat_id,
         "⏳ *Mengambil data kuota model dari Antigravity CLI...*",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.MARKDOWN,
+        message_thread_id=thread_id
     )
 
+    fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
     try:
-        report_html = await fetch_agy_usage_report()
+        report_html = await fetch_fn()
         if status_msg:
             await safe_edit_message(status_msg, report_html, parse_mode=ParseMode.HTML)
         else:
-            await safe_send_message(context.bot, chat_id, report_html, parse_mode=ParseMode.HTML)
+            await safe_send_message(context.bot, chat_id, report_html, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
     except Exception as e:
         logger.error(f"Error handling /usage: {e}", exc_info=True)
         err_msg = f"❌ Gagal mengambil data kuota:\n<code>{html.escape(str(e))}</code>"
         if status_msg:
             await safe_edit_message(status_msg, err_msg, parse_mode=ParseMode.HTML)
         else:
-            await safe_send_message(context.bot, chat_id, err_msg, parse_mode=ParseMode.HTML)
+            await safe_send_message(context.bot, chat_id, err_msg, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
     user_id = update.effective_user.id
-    current_conv = user_conversations.get(user_id)
+    chat_id = update.effective_chat.id
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
+
+    db = get_db()
+    current_conv = None
+    if thread_id is not None:
+        topic_binding = db.get_topic_binding(chat_id, thread_id)
+        if topic_binding:
+            current_conv = topic_binding.get("conv_id")
+    if not current_conv:
+        current_conv = user_conversations.get(user_id)
+
+    selected_model = db.get_user_model(user_id, chat_id, thread_id or "root") or DEFAULT_MODEL
     running_proc = user_processes.get(user_id)
     is_proc_running = running_proc is not None and running_proc.returncode is None
     bin_exists = os.path.exists(AGY_BIN_PATH) or shutil.which(AGY_BIN_PATH) is not None
@@ -1257,25 +703,31 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_text = (
         "📊 **Status Sistem Antigravity Bot (CLI Engine)**\n\n"
         f"• **Engine**: `Native agy CLI Subprocess`\n"
+        f"• **Model Aktif**: `{selected_model}`\n"
         f"• **Binary Path**: `{AGY_BIN_PATH}` ({'✅ Ditemukan' if bin_exists else '❌ Tidak Ditemukan!'})\n"
-        f"• **Workspace Path**: `{WORKSPACE_DIR}`\n"
+        f"• **Workspace Path**: `{globals().get('WORKSPACE_DIR', WORKSPACE_DIR)}`\n"
         f"• **Approval Mode**: `{APPROVAL_MODE}`\n"
         f"• **Approval Timeout**: `{APPROVAL_TIMEOUT_SECONDS} detik`\n"
         f"• **Execution Timeout**: `{AGY_TIMEOUT_SECONDS} detik`\n"
         f"• **Sesi Percakapan**: `{current_conv if current_conv else 'Belum ada (Fresh)'}`\n"
+        f"• **Topik Thread**: `{'Thread ' + str(thread_id) if thread_id is not None else 'Root Chat'}`\n"
         f"• **Status Tugas Saat Ini**: `{'⏳ Sedang Berjalan (PID: ' + str(running_proc.pid) + ')' if is_proc_running else '💤 Idle'}`\n"
         f"• **Whitelist User ID**: `{user_id}` (Terverifikasi)\n"
         f"• **Pending Approvals**: `{len(pending_approvals)}`"
     )
-    await safe_send_message(context.bot, update.effective_chat.id, status_text)
+    await safe_send_message(context.bot, chat_id, status_text, parse_mode=ParseMode.MARKDOWN, message_thread_id=thread_id)
+
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
 
-    # 1. Hentikan proses yang sedang berjalan jika ada
+    # 1. Hentikan proses yang sedang berjalan
     proc = user_processes.get(user_id)
     if proc and proc.returncode is None:
         try:
@@ -1287,10 +739,16 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task and not task.done():
         task.cancel()
 
-    # 2. Hapus memori percakapan
+    # 2. Reset memori
     old_conv = user_conversations.pop(user_id, None)
+    if thread_id is not None:
+        db = get_db()
+        binding = db.get_topic_binding(chat_id, thread_id)
+        if binding and binding.get("conv_id"):
+            old_conv = binding.get("conv_id")
+        db.set_topic_binding(chat_id, thread_id, conv_id="", topic_name="Umum / General")
 
-    # 3. Batalkan approval yang tertunda
+    # 3. Batalkan approval tertunda
     for req_id, info in list(pending_approvals.items()):
         if info.get("user_id") == user_id:
             fut = info.get("future")
@@ -1299,20 +757,25 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_send_message(
         context.bot,
-        update.effective_chat.id,
+        chat_id,
         "🔄 **Sesi Percakapan Direset!**\n"
         f"Riwayat percakapan lama ({old_conv[:8] + '...' if old_conv else 'None'}) telah dibersihkan. "
-        "Instruksi berikutnya akan memulai percakapan baru di `agy`."
+        "Instruksi berikutnya akan memulai percakapan baru di `agy`.",
+        parse_mode=ParseMode.MARKDOWN,
+        message_thread_id=thread_id
     )
+
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
     cancelled_anything = False
 
-    # 1. Matikan subprocess agy aktif
     proc = user_processes.get(user_id)
     if proc and proc.returncode is None:
         try:
@@ -1325,13 +788,11 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"Error mematikan proses {user_id}: {e}")
 
-    # 2. Batalkan async task
     task = user_tasks.get(user_id)
     if task and not task.done():
         task.cancel()
         cancelled_anything = True
 
-    # 3. Batalkan pending approvals
     for req_id, info in list(pending_approvals.items()):
         if info.get("user_id") == user_id:
             fut = info.get("future")
@@ -1351,18 +812,36 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cancelled_anything:
         await safe_send_message(
             context.bot,
-            update.effective_chat.id,
-            "🛑 **Tugas berhasil dibatalkan!** Subprocess `agy` dan eksekusi telah dihentikan."
+            chat_id,
+            "🛑 **Tugas berhasil dibatalkan!** Subprocess `agy` dan eksekusi telah dihentikan.",
+            parse_mode=ParseMode.MARKDOWN,
+            message_thread_id=thread_id
         )
     else:
         await safe_send_message(
             context.bot,
-            update.effective_chat.id,
-            "ℹ️ Tidak ada tugas atau proses `agy` yang sedang berjalan saat ini."
+            chat_id,
+            "ℹ️ Tidak ada tugas atau proses `agy` yang sedang berjalan saat ini.",
+            parse_mode=ParseMode.MARKDOWN,
+            message_thread_id=thread_id
         )
 
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Central callback router for approval confirmations and model selection."""
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    data = query.data
+    if data.startswith("appr:") or data.startswith("deny:"):
+        await handle_approval_callback(update, context)
+    elif data.startswith("model_"):
+        await handle_model_callback(update, context)
+
+
 # ==============================================================================
-# AGENT WORKFLOW & MESSAGE PROCESSING
+# AGENT WORKFLOW & MESSAGE EXECUTION
 # ==============================================================================
 async def execute_agent_turn(
     update: Update,
@@ -1370,15 +849,20 @@ async def execute_agent_turn(
     user_text: str
 ):
     """
-    Eksekusi satu putaran instruksi ke agy CLI subprocess.
-    Dijalankan di dalam user mutex lock dan terlindungi oleh /cancel.
+    Executes one turn against native agy CLI subprocess under user mutex lock.
+    Incorporates Hermes reactions, quiet pinning, in-place status, draft streaming,
+    and automatic topic renaming.
     """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    reply_id = update.message.message_id if update.message else None
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
 
-    # 1. Evaluasi Hardline Security Blocklist
-    if is_hardline_blocked(user_text):
+    raw_reply = getattr(update.message, "message_id", None)
+    reply_id = raw_reply if isinstance(raw_reply, int) else None
+
+    # 1. Hardline Security Blocklist
+    if is_hardline_blocked(str(user_text)):
         logger.error(f"🚨 HARDLINE SECURITY BLOCKLIST TRIGGERED: {user_text}")
         await safe_send_message(
             bot=context.bot,
@@ -1388,30 +872,37 @@ async def execute_agent_turn(
                 f"Instruksi berikut terdeteksi berisiko katastropik dan **DIBLOKIR TOTAL** demi integritas sistem:\n"
                 f"```bash\n{user_text}\n```"
             ),
-            reply_to_message_id=reply_id
+            reply_to_message_id=reply_id,
+            message_thread_id=thread_id,
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # 2. Evaluasi Hermes Interactive Approval (Intent Guard)
-    is_destruct, reason = is_destructive_prompt(user_text)
+    # 2. Intent Guard (Interactive Approval)
+    is_destruct, reason = is_destructive_prompt(str(user_text))
     if is_destruct:
         approved = await request_user_approval(
             bot=context.bot,
             chat_id=chat_id,
             user_id=user_id,
-            prompt=user_text,
-            reason=reason
+            prompt=str(user_text),
+            reason=reason,
+            message_thread_id=thread_id
         )
         if not approved:
             await safe_send_message(
                 context.bot,
                 chat_id,
                 "❌ **Instruksi Ditolak.** Eksekusi tidak dijalankan.",
-                reply_to_message_id=reply_id
+                reply_to_message_id=reply_id,
+                message_thread_id=thread_id,
+                parse_mode=ParseMode.MARKDOWN
             )
             return
 
-    # 3. Jalankan melalui agy CLI Subprocess (Silent status notification & quote reply anchor)
+    # 3. Lifecycle Start: Reaction 👀 & Quiet Pin
+    await on_turn_start(context.bot, chat_id, reply_id)
+
     turn_start_time = time.time()
     status_msg = await safe_send_message(
         context.bot,
@@ -1419,47 +910,62 @@ async def execute_agent_turn(
         "⏳ *Antigravity sedang berpikir & memproses...*",
         parse_mode=ParseMode.MARKDOWN,
         disable_notification=True,
-        reply_to_message_id=reply_id
+        reply_to_message_id=reply_id,
+        message_thread_id=thread_id
     )
 
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(
-        send_typing_and_progress(context.bot, chat_id, status_msg, stop_typing)
+        send_typing_and_progress(context.bot, chat_id, status_msg, stop_typing, message_thread_id=thread_id)
     )
 
-    try:
+    db = get_db()
+    active_conv = None
+    if thread_id is not None:
+        active_conv, _ = get_conversation_for_message(chat_id, thread_id)
+    if not active_conv:
         active_conv = user_conversations.get(user_id)
-        output_text, new_conv_id = await run_agy_cli(
+
+    active_model = db.get_user_model(user_id, chat_id, thread_id or "root") or DEFAULT_MODEL
+    current_workspace = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
+    turn_success = False
+
+    run_fn = getattr(sys.modules[__name__], "run_agy_cli", run_agy_cli)
+    try:
+        output_text, new_conv_id = await run_fn(
             user_id=user_id,
-            prompt=user_text,
+            prompt=str(user_text),
             conv_id=active_conv,
-            cwd=WORKSPACE_DIR
+            cwd=current_workspace,
+            model=active_model
         )
+        turn_success = True
 
         elapsed_seconds = max(1, int(time.time() - turn_start_time))
         duration_str = f"~{elapsed_seconds}s" if elapsed_seconds < 60 else f"~{elapsed_seconds // 60}m {elapsed_seconds % 60}s"
 
-        # Simpan atau perbarui conversation_id untuk memori multi-turn
         if new_conv_id:
-            user_conversations[user_id] = new_conv_id
+            if thread_id is not None:
+                bind_conversation_to_topic(chat_id, thread_id, new_conv_id)
+                asyncio.create_task(auto_rename_forum_topic(context.bot, chat_id, thread_id, str(user_text), output_text))
+            else:
+                user_conversations[user_id] = new_conv_id
 
-        # 4. Deteksi dan kirim berkas media jika ada
-        media_paths = extract_media_paths(output_text, workspace_dir=WORKSPACE_DIR)
+        # 4. Media Dispatch with strict Security Path Traversal Guard
+        media_paths = extract_media_paths(output_text, workspace_dir=current_workspace)
 
-        # 5. Format teks output menggunakan konverter Telegram HTML yang rapi & aman
+        # 5. Format HTML with badge
         formatted_html = markdown_to_telegram_html(output_text)
-
-        # Tambahkan badge durasi pengerjaan jika belum ada di baris terakhir output
         non_empty_lines = [l.strip() for l in formatted_html.splitlines() if l.strip()]
         last_line = non_empty_lines[-1].lower() if non_empty_lines else ""
         has_footer = bool(re.search(r"^⏱️.*(?:respons dalam|waktu respons|durasi pengerjaan)", last_line))
         if not has_footer:
             formatted_html = f"{formatted_html.rstrip()}\n\n⏱️ <i>Respons dalam {duration_str}</i>"
 
-        # 6. Potong teks agar muat di batas limit Telegram (4000 char)
+        # 6. Split message safely (<4000 char)
         chunks = split_message(formatted_html, max_length=4000)
 
-        # Hapus pesan status tunggu sementara agar balasan final memiliki timestamp asli & memicu notifikasi baru
+        # Remove temporary waiting bubble
         if status_msg:
             try:
                 await status_msg.delete()
@@ -1467,6 +973,7 @@ async def execute_agent_turn(
                 pass
             status_msg = None
 
+        # Send formatted chunks
         for i, chunk in enumerate(chunks):
             await safe_send_message(
                 context.bot,
@@ -1474,32 +981,22 @@ async def execute_agent_turn(
                 chunk,
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=reply_id if i == 0 else None,
+                message_thread_id=thread_id,
                 disable_notification=False
             )
 
-        # Kirim file media yang terdeteksi
-        for file_path in media_paths:
-            try:
-                file_name = os.path.basename(file_path)
-                with open(file_path, "rb") as doc_file:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=doc_file,
-                        caption=f"📄 Berkas: `{file_name}`",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                logger.info(f"Berhasil mengirim dokumen Telegram: {file_path}")
-            except Exception as e:
-                logger.error(f"Gagal mengirim berkas {file_path} via Telegram: {e}")
-                await safe_send_message(
-                    context.bot,
-                    chat_id,
-                    f"⚠️ Gagal mengirim berkas `{os.path.basename(file_path)}`: {str(e)}"
-                )
+        # Dispatch outbound media files (voice, photo, video, doc)
+        for fpath in media_paths:
+            await send_outbound_media(
+                bot=context.bot,
+                chat_id=chat_id,
+                file_path=fpath,
+                reply_to_message_id=reply_id,
+                message_thread_id=thread_id
+            )
 
     except asyncio.CancelledError:
         logger.info(f"Task user {user_id} dibatalkan.")
-        cancel_text = "🛑 *Tugas dibatalkan oleh pengguna via /cancel.*"
         if status_msg:
             try:
                 await status_msg.delete()
@@ -1509,18 +1006,20 @@ async def execute_agent_turn(
         await safe_send_message(
             context.bot,
             chat_id,
-            cancel_text,
+            "🛑 *Tugas dibatalkan oleh pengguna via /cancel.*",
             parse_mode=ParseMode.MARKDOWN,
             reply_to_message_id=reply_id,
+            message_thread_id=thread_id,
             disable_notification=False
         )
+        await on_turn_complete(context.bot, chat_id, reply_id, success=False, cancelled=True)
         raise
     except Exception as e:
         logger.error(f"Error saat mengeksekusi agy: {e}", exc_info=True)
         err_msg = (
             f"❌ <b>Terjadi kesalahan saat memproses permintaan:</b>\n"
             f"<pre><code>{html.escape(str(e))[:1000]}</code></pre>\n\n"
-            f"💡 <i>Petunjuk:</i> Pastikan binary <code>agy</code> terpasang di path yang sesuai atau gunakan <code>/reset</code> untuk me-restart sesi."
+            f"💡 <i>Petunjuk:</i> Pastikan binary <code>agy</code> terpasang di path yang sesuai atau gunakan <code>/reset</code>."
         )
         if status_msg:
             try:
@@ -1534,24 +1033,25 @@ async def execute_agent_turn(
             err_msg,
             parse_mode=ParseMode.HTML,
             reply_to_message_id=reply_id,
+            message_thread_id=thread_id,
             disable_notification=False
         )
+        await on_turn_complete(context.bot, chat_id, reply_id, success=False)
     finally:
         stop_typing.set()
         typing_task.cancel()
+        if turn_success:
+            await on_turn_complete(context.bot, chat_id, reply_id, success=True)
+
 
 async def _dispatch_agent_turn(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     prompt: str
 ):
-    """
-    Helper untuk mengeksekusi prompt ke agy CLI subprocess
-    dalam kendali mutex lock dan pelacakan task asinkron per pengguna.
-    """
+    """Dispatches prompt into user mutex lock queue."""
     user_id = update.effective_user.id
 
-    # Cek apakah ada tugas yang masih berjalan untuk user ini
     existing_task = user_tasks.get(user_id)
     if existing_task and not existing_task.done():
         if update.message:
@@ -1582,20 +1082,16 @@ async def _dispatch_agent_turn(
     task.add_done_callback(_cleanup_task)
 
 
+# ==============================================================================
+# INBOUND MEDIA & MESSAGE HANDLERS
+# ==============================================================================
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk gambar / screenshot yang dikirimkan oleh pengguna."""
     if not is_authorized(update):
-        logger.warning(
-            f"Unauthorized photo upload attempt from User ID: "
-            f"{update.effective_user.id if update.effective_user else 'Unknown'}"
-        )
         return
-
     if not update.message or not update.message.photo:
         return
 
     user_id = update.effective_user.id
-    # Ambil foto dengan resolusi tertinggi (elemen terakhir dalam daftar photo)
     photo = update.message.photo[-1]
 
     try:
@@ -1624,18 +1120,13 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         f"{caption_prompt}"
     )
 
-    await _dispatch_agent_turn(update, context, prompt_text)
+    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
+    await dispatch_fn(update, context, prompt_text)
 
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk berkas dokumen / kode / log yang dikirimkan oleh pengguna."""
     if not is_authorized(update):
-        logger.warning(
-            f"Unauthorized document upload attempt from User ID: "
-            f"{update.effective_user.id if update.effective_user else 'Unknown'}"
-        )
         return
-
     if not update.message or not update.message.document:
         return
 
@@ -1676,55 +1167,96 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         f"{caption_prompt}"
     )
 
-    await _dispatch_agent_turn(update, context, prompt_text)
+    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
+    await dispatch_fn(update, context, prompt_text)
+
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inbound Voice Note / Audio memo handler."""
+    if not is_authorized(update):
+        return
+    msg = update.message
+    if not msg or not (msg.voice or msg.audio):
+        return
+
+    media = msg.voice or msg.audio
+    user_id = update.effective_user.id
+
+    try:
+        file_obj = await media.get_file()
+        ext = ".ogg" if msg.voice else ".mp3"
+        filename = f"voice_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+        upload_dir = get_upload_dir()
+        dest_path = (upload_dir / filename).resolve()
+        await file_obj.download_to_drive(custom_path=dest_path)
+        logger.info(f"Voice memo berhasil diunduh ke: {dest_path}")
+    except Exception as e:
+        logger.error(f"Gagal mengunduh audio: {e}")
+        if msg:
+            await msg.reply_text(f"❌ Gagal mengunduh pesan suara: {e}")
+        return
+
+    caption = (msg.caption or "").strip()
+    prompt_text = (
+        f"[PENGGUNA MENGIRIMKAN REKAMAN SUARA / VOICE NOTE]\n"
+        f"Berkas audio tersimpan di: {dest_path}\n\n"
+        f"[CATATAN / CAPTION]:\n{caption if caption else 'Mohon dengarkan dan tindak lanjuti pesan suara ini.'}"
+    )
+    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
+    await dispatch_fn(update, context, prompt_text)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Router utama untuk pesan teks yang masuk dari pengguna."""
+    """Main router for incoming text messages."""
     if not is_authorized(update):
-        logger.warning(
-            f"Unauthorized access attempt from User ID: "
-            f"{update.effective_user.id if update.effective_user else 'Unknown'}"
-        )
+        user_id = update.effective_user.id if update.effective_user else "Unknown"
+        logger.warning(f"Unauthorized text message attempt from User ID: {user_id}")
         return
 
-    user_id = update.effective_user.id
-    user_text = update.message.text if update.message else ""
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
+
+    # Expand any hidden text_link URLs
+    user_text = ""
+    if update.message:
+        if isinstance(update.message.text, str):
+            user_text = expand_link_entities(update.message)
+        elif isinstance(getattr(update.message, "caption", None), str):
+            user_text = expand_link_entities(update.message)
 
     if not user_text.strip():
         return
 
-    # Deteksi Intent Cek Kuota / Limit Akun (Smart Interceptor)
-    if is_quota_inquiry(user_text):
-        logger.info(f"User {user_id} menanyakan kuota/limit via pesan: '{user_text}'")
+    # Intent Interceptor: Quota / Usage Inquiry
+    inquiry_fn = getattr(sys.modules[__name__], "is_quota_inquiry", is_quota_inquiry)
+    if inquiry_fn(user_text):
         status_msg = await safe_send_message(
             context.bot,
             update.effective_chat.id,
             "⏳ *Mengambil data kuota model dari Antigravity CLI...*",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            message_thread_id=thread_id
         )
+        fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
         try:
-            report_html = await fetch_agy_usage_report()
+            report_html = await fetch_fn()
             if status_msg:
                 await safe_edit_message(status_msg, report_html, parse_mode=ParseMode.HTML)
             else:
-                await safe_send_message(context.bot, update.effective_chat.id, report_html, parse_mode=ParseMode.HTML)
+                await safe_send_message(context.bot, update.effective_chat.id, report_html, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
         except Exception as e:
-            logger.error(f"Error saat mengambil data kuota untuk user {user_id}: {e}", exc_info=True)
-            err_msg = f"❌ Gagal mengambil data kuota:\n<code>{html.escape(str(e))}</code>"
-            if status_msg:
-                await safe_edit_message(status_msg, err_msg, parse_mode=ParseMode.HTML)
-            else:
-                await safe_send_message(context.bot, update.effective_chat.id, err_msg, parse_mode=ParseMode.HTML)
+            logger.error(f"Error handling quota inquiry: {e}")
         return
 
-    await _dispatch_agent_turn(update, context, user_text)
+    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
+    await dispatch_fn(update, context, user_text)
+
 
 # ==============================================================================
-# MAIN APPLICATION ENTRYPOINT & LIFECYCLE HOOKS
+# LIFECYCLE HOOKS & APPLICATION BUILDER
 # ==============================================================================
 async def post_init(application):
-    """Mendaftarkan menu perintah bot secara otomatis ke Telegram API saat startup."""
+    """Registers bot commands with Telegram API on startup."""
     commands = [
         BotCommand("usage", "📊 Cek kuota model & sisa limit"),
         BotCommand("status", "ℹ️ Status engine, PID, & memori"),
@@ -1738,8 +1270,9 @@ async def post_init(application):
     except Exception as e:
         logger.warning(f"Gagal mendaftarkan bot commands: {e}")
 
+
 async def post_shutdown(application):
-    """Membersihkan seluruh subprocess agy yang masih berjalan saat bot dimatikan."""
+    """Cleans up running subprocesses and state on shutdown."""
     logger.info("Menutup seluruh subprocess Antigravity...")
     for user_id, proc in list(user_processes.items()):
         try:
@@ -1750,48 +1283,59 @@ async def post_shutdown(application):
     user_processes.clear()
     user_conversations.clear()
 
+
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN belum diatur di file .env! Bot tidak dapat berjalan.")
         sys.exit(1)
 
     if not ALLOWED_USER_IDS:
-        logger.warning("⚠️ ALLOWED_USER_ID belum diatur atau bernilai 0. Tidak ada pengguna yang dapat mengakses bot!")
+        logger.warning("⚠️ ALLOWED_USER_ID belum diatur. Tidak ada pengguna yang dapat mengakses bot!")
 
-    logger.info(f"🤖 Antigravity Engine : Subprocess agy CLI")
+    logger.info(f"🤖 Antigravity Engine : Subprocess agy CLI (Hermes-Parity)")
     logger.info(f"📂 Binary Path        : {AGY_BIN_PATH}")
     logger.info(f"🛡️ Whitelist User IDs : {ALLOWED_USER_IDS}")
     logger.info(f"⚙️ Approval Mode      : {APPROVAL_MODE} (Timeout: {APPROVAL_TIMEOUT_SECONDS}s)")
     logger.info(f"📁 Workspace Path     : {WORKSPACE_DIR}")
 
+    request_client = build_resilient_request(
+        proxy_url=TELEGRAM_PROXY if TELEGRAM_PROXY else None,
+        enable_fallback=TELEGRAM_FALLBACK_TRANSPORT
+    )
+
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_BOT_TOKEN)
+        .request(request_client)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
 
-    # Daftarkan command handlers
+    # Command Handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("model", handle_model_command))
+    app.add_handler(CommandHandler("topic", handle_topic_command))
     app.add_handler(CommandHandler(["usage", "limit"], usage_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Daftarkan handler tombol konfirmasi Approve / Deny
+    # Callback Query Handlers (Approval & Model selection)
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Daftarkan handler pesan media & dokumen
+    # Media Handlers
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
 
-    # Daftarkan handler pesan teks
+    # Text Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🚀 Antigravity CLI Telegram Bot siap berjalan...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

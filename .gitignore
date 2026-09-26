@@ -43,6 +43,8 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Telegram Uploads
+# Telegram Uploads & State
 .telegram_uploads/
+.telegram_state/
+*.db
 
