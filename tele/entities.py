@@ -78,7 +78,7 @@ def clean_bot_mentions(text: Optional[str], bot_username: str = "") -> str:
     """Strips @bot_username mentions from message prompt."""
     if not text or not isinstance(text, str):
         return ""
-    if bot_username:
+    if bot_username and isinstance(bot_username, str):
         clean = re.sub(rf"@{re.escape(bot_username)}\b", "", text, flags=re.IGNORECASE)
     else:
         clean = re.sub(r"@[a-zA-Z0-9_]+bot\b", "", text, flags=re.IGNORECASE)

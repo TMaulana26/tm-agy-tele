@@ -720,7 +720,10 @@ docker ps -a
         mock_app.bot.set_my_commands.assert_called_once()
         commands = mock_app.bot.set_my_commands.call_args[0][0]
         cmd_names = [c.command for c in commands]
-        self.assertEqual(cmd_names, ["usage", "status", "cancel", "reset", "help"])
+        self.assertEqual(cmd_names, [
+            "help", "model", "topic", "topics", "title", "deletetopic",
+            "sessions", "resume", "reset", "usage", "status", "cancel"
+        ])
 
     async def test_post_init_set_my_commands_error_handled(self):
         mock_app = MagicMock()

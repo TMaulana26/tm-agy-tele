@@ -130,6 +130,40 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def send_model_picker(
+    chat_id: int,
+    thread_id: Optional[int] = None,
+    page: int = 0,
+    context: Optional[ContextTypes.DEFAULT_TYPE] = None,
+    bot: Optional[Any] = None,
+    user_id: Optional[int] = None,
+) -> None:
+    """Sends the interactive model picker to a specific chat/thread."""
+    target_bot = bot or (context.bot if context else None)
+    if not target_bot:
+        return
+    db = get_db()
+    effective_thread = thread_id or "root"
+    current_model = db.get_user_model(user_id or chat_id, chat_id, effective_thread) or DEFAULT_MODEL
+    models = await fetch_available_models()
+    keyboard = build_model_keyboard(models, current_model, page=page)
+    model_name = next((m['name'] for m in models if m['id'] == current_model), current_model)
+    text = (
+        f"🤖 <b>Pilih Model AI untuk Sesi Ini:</b>\n"
+        f"Model saat ini: <code>{model_name}</code>\n\n"
+        f"<i>Klik tombol di bawah untuk mengganti model:</i>"
+    )
+    send_kwargs = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": keyboard,
+        "parse_mode": ParseMode.HTML,
+    }
+    if thread_id is not None:
+        send_kwargs["message_thread_id"] = thread_id
+    await target_bot.send_message(**send_kwargs)
+
+
 async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles pagination and selection clicks in the /model picker."""
     query = update.callback_query

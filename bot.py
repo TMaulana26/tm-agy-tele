@@ -94,11 +94,14 @@ from tele.streaming import (
 from tele.formatters import markdown_to_telegram_html, append_duration_badge
 from tele.topics import (
     handle_topic_command,
+    handle_topics_command,
+    handle_title_command,
+    handle_delete_topic_command,
     get_conversation_for_message,
     bind_conversation_to_topic,
     auto_rename_forum_topic,
 )
-from tele.picker import handle_model_command, handle_model_callback
+from tele.picker import handle_model_command, handle_model_callback, send_model_picker
 
 # Core Engine & Approval
 from core.approval import (
@@ -623,26 +626,110 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send_message(context.bot, update.effective_chat.id, welcome_text, parse_mode=ParseMode.MARKDOWN)
 
 
+def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMarkup]:
+    """Builds interactive Help Center views with categorized guidance and navigation buttons."""
+    if category == "topics":
+        text = (
+            "💬 <b>Panduan Topik & Multi-Session DM (Ala Hermes)</b>\n\n"
+            "Fitur ini membagi percakapan menjadi sub-topik terisolasi layaknya forum di dalam DM:\n\n"
+            "• <code>/topic</code> — Cek status & inisialisasi Threaded Mode.\n"
+            "• <code>/topic &lt;nama&gt;</code> — Buat topik baru langsung dengan nama (contoh: <code>/topic Refactor Auth</code>).\n"
+            "• <code>/topics</code> — Lihat daftar seluruh topik aktif beserta ID thread-nya.\n"
+            "• <code>/title &lt;nama baru&gt;</code> — Ganti nama topik yang sedang dibuka.\n"
+            "• <code>/deletetopic</code> (alias: <code>/rmtopic</code>) — Hapus topik saat ini beserta riwayat binding-nya.\n\n"
+            "💡 <i>Tiap topik memiliki memori percakapan independen tanpa mencemari topik lain!</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+        ])
+        return text, keyboard
+
+    if category == "sessions":
+        text = (
+            "🗂️ <b>Panduan Sesi & Memori Percakapan</b>\n\n"
+            "Antigravity menyimpan riwayat percakapan di sistem dalam format multi-turn:\n\n"
+            "• <code>/sessions</code> — Tampilkan riwayat ID sesi percakapan terbaru.\n"
+            "• <code>/resume &lt;id_sesi&gt;</code> — Lanjutkan kembali konteks percakapan lama.\n"
+            "• <code>/reset</code> (alias: <code>/new</code>, <code>/clear</code>) — Hapus memori aktif & mulai sesi fresh.\n"
+            "• <code>/cancel</code> — Hentikan paksa proses CLI yang sedang berjalan (<code>SIGTERM</code>/<code>SIGKILL</code>).\n\n"
+            "💡 <i>Gunakan /reset bila model mulai keluar konteks atau ingin memulai tugas baru.</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+        ])
+        return text, keyboard
+
+    if category == "security":
+        text = (
+            "🛡️ <b>Panduan Keamanan & Sandbox (Hermes Guard)</b>\n\n"
+            "Bot dilengkapi pengaman berlapis untuk melindungi VPS & data Akang:\n\n"
+            "• <b>Interactive Approval</b>: Instruksi berisiko (drop table, rm -rf, git force) wajib disetujui manual via tombol Approve / Deny (timeout 120 detik, fail-closed).\n"
+            "• <b>Hardline Blocklist</b>: Perintah katastropik sistem (<code>rm -rf /</code>, <code>mkfs</code>, <code>dd</code>, <code>shutdown</code>) <b>DIBLOKIR TOTAL</b>.\n"
+            "• <b>Media Guard</b>: Pengiriman file sensitif (<code>.env</code>, <code>state.db</code>, <code>auth.json</code>, SSH keys) dilarang secara ketat."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+        ])
+        return text, keyboard
+
+    if category == "system":
+        text = (
+            "⚙️ <b>Perintah Sistem & Utilitas</b>\n\n"
+            "• <code>/status</code> — Informasi engine, PID proses aktif, path workspace, & status memory.\n"
+            "• <code>/usage</code> (alias: <code>/limit</code>) — Tampilkan sisa kuota model & waktu refresh.\n"
+            "• <code>/model</code> — Buka pemilih model interaktif (Gemini 3.8, Claude, dll).\n"
+            "• <code>/cancel</code> — Hentikan eksekusi perintah yang sedang berjalan."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+        ])
+        return text, keyboard
+
+    # Default: "main"
+    text = (
+        "📖 <b>Antigravity CLI — Interactive Help Center</b>\n\n"
+        "Selamat datang di pusat bantuan interaktif Antigravity Telegram Bot! "
+        "Bot ini memberi Anda akses penuh ke native <code>agy</code> CLI dengan keamanan ala Hermes.\n\n"
+        "Silakan pilih kategori panduan di bawah atau klik tombol aksi cepat:"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🤖 Pilih Model", callback_data="help:act_model"),
+            InlineKeyboardButton("📊 Cek Kuota", callback_data="help:act_usage")
+        ],
+        [
+            InlineKeyboardButton("💬 Panduan Topik", callback_data="help:cat_topics"),
+            InlineKeyboardButton("🗂️ Panduan Sesi", callback_data="help:cat_sessions")
+        ],
+        [
+            InlineKeyboardButton("🛡️ Keamanan & Guard", callback_data="help:cat_security"),
+            InlineKeyboardButton("⚙️ Perintah Sistem", callback_data="help:cat_system")
+        ],
+        [
+            InlineKeyboardButton("ℹ️ Status Engine", callback_data="help:act_status"),
+            InlineKeyboardButton("✨ Sesi Baru", callback_data="help:act_reset")
+        ]
+    ])
+    return text, keyboard
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    help_text = (
-        "📖 **Panduan Penggunaan Antigravity Telegram Bot**\n\n"
-        "**1. Perintah Bot:**\n"
-        "• `/model`  : Memilih model AI aktif (Gemini 3.8 Flash, Claude Sonnet 4.6, dll).\n"
-        "• `/topic`  : Membuka mode Multi-Session DM (Private Forum Topics ala Hermes).\n"
-        "• `/usage`  : Menampilkan sisa kuota dan waktu refresh limit model secara real-time.\n"
-        "• `/status` : Informasi engine, binary path, memori multi-turn, dan PID proses.\n"
-        "• `/cancel` : Mematikan proses `agy` yang sedang berjalan secara instan (`SIGTERM`/`SIGKILL`).\n"
-        "• `/reset`  : Menghapus sesi aktif dan memulai percakapan baru.\n\n"
-        "**2. Keamanan & Approval (Ala Hermes):**\n"
-        "• Perintah berisiko tinggi (hapus database, drop table, rm -rf, git force) memunculkan tombol konfirmasi.\n"
-        "• Perintah katastropik OS (`rm -rf /`, `mkfs`, `dd`, `shutdown`) **DIBLOKIR TOTAL**.\n\n"
-        "**3. Pengiriman Berkas & Media:**\n"
-        "Kirim dokumen, foto, atau suara langsung ke chat. Hasil file dari model otomatis dikirim kembali."
+    chat_id = update.effective_chat.id
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
+
+    text, reply_markup = get_help_menu_content("main")
+    await safe_send_message(
+        context.bot,
+        chat_id,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        message_thread_id=thread_id
     )
-    await safe_send_message(context.bot, update.effective_chat.id, help_text, parse_mode=ParseMode.MARKDOWN)
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -766,6 +853,114 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists recent conversation sessions on host and current active binding."""
+    if not is_authorized(update):
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
+
+    db = get_db()
+    current_conv = None
+    if thread_id is not None:
+        binding = db.get_topic_binding(chat_id, thread_id)
+        if binding:
+            current_conv = binding.get("conv_id")
+    if not current_conv:
+        current_conv = user_conversations.get(user_id)
+
+    current_workspace = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
+    home = Path.home()
+    candidate_bases = [
+        home / ".gemini" / "antigravity-cli" / "brain",
+        home / ".gemini" / "antigravity" / "brain",
+        Path("/home/ubuntu/.gemini/antigravity-cli/brain"),
+        Path("/home/ubuntu/.gemini/antigravity/brain"),
+        Path(current_workspace) / ".gemini" / "brain",
+    ]
+    valid_bases = [b for b in candidate_bases if b.is_dir()]
+
+    discovered = []
+    seen_ids = set()
+    for base in valid_bases:
+        try:
+            for item in base.iterdir():
+                if item.is_dir() and item.name not in seen_ids:
+                    t_path = item / ".system_generated" / "logs" / "transcript.jsonl"
+                    if t_path.is_file():
+                        mtime = t_path.stat().st_mtime
+                        discovered.append((mtime, item.name, base))
+                        seen_ids.add(item.name)
+        except Exception:
+            pass
+
+    discovered.sort(key=lambda x: x[0], reverse=True)
+    recent = discovered[:8]
+
+    if not recent:
+        msg = (
+            "🗂️ <b>Riwayat Sesi Antigravity:</b>\n\n"
+            "Belum ada sesi percakapan yang ditemukan pada host ini.\n"
+            f"Sesi aktif saat ini: <code>{current_conv or 'Fresh / Belum dimulai'}</code>"
+        )
+        await safe_send_message(context.bot, chat_id, msg, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+        return
+
+    lines = ["🗂️ <b>Daftar Sesi Percakapan Antigravity Terbaru:</b>\n"]
+    for idx, (mtime, cid, base) in enumerate(recent, 1):
+        rel_time = format_relative_time(mtime)
+        is_active = " 👈 <i>(Aktif)</i>" if cid == current_conv else ""
+        lines.append(f"{idx}. <code>{cid}</code> ({rel_time}){is_active}")
+
+    lines.append("\n💡 <i>Gunakan perintah:</i> <code>/resume &lt;id_sesi&gt;</code> <i>untuk berpindah ke sesi tersebut.</i>")
+    await safe_send_message(context.bot, chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switches active session to a specified conversation ID."""
+    if not is_authorized(update):
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    raw_thread = getattr(update.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
+
+    args = context.args if context.args else []
+    target_id = args[0].strip() if args else ""
+
+    if not target_id:
+        await safe_send_message(
+            context.bot,
+            chat_id,
+            "⚠️ <b>Format Perintah Salah</b>\n\n"
+            "Gunakan: <code>/resume &lt;id_sesi&gt;</code>\n"
+            "Contoh: <code>/resume 735b76d9-c9ca-405f-b911-00c17daa777f</code>\n\n"
+            "Ketik <code>/sessions</code> untuk melihat daftar ID sesi yang tersedia.",
+            parse_mode=ParseMode.HTML,
+            message_thread_id=thread_id
+        )
+        return
+
+    db = get_db()
+    if thread_id is not None:
+        db.set_topic_binding(chat_id, thread_id, conv_id=target_id)
+    else:
+        user_conversations[user_id] = target_id
+
+    await safe_send_message(
+        context.bot,
+        chat_id,
+        f"✓ <b>Berhasil beralih ke sesi:</b>\n<code>{target_id}</code>\n\n"
+        "Instruksi berikutnya akan melanjutkan konteks dan riwayat dari sesi tersebut.",
+        parse_mode=ParseMode.HTML,
+        message_thread_id=thread_id
+    )
+
+
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
@@ -828,7 +1023,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Central callback router for approval confirmations and model selection."""
+    """Central callback router for approval confirmations, model selection, and help center."""
     query = update.callback_query
     if query is None or not query.data:
         return
@@ -838,6 +1033,44 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_approval_callback(update, context)
     elif data.startswith("model_"):
         await handle_model_callback(update, context)
+    elif data.startswith("help:"):
+        await handle_help_callback(update, context)
+
+
+async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles interactive navigation in the Help Center."""
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    await query.answer()
+
+    action = query.data.split(":", 1)[1]
+    chat_id = query.message.chat_id
+    raw_thread = getattr(query.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else None
+
+    if action.startswith("cat_"):
+        category = action[4:]
+        text, markup = get_help_menu_content(category)
+        await safe_edit_message(query.message, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    elif action == "main":
+        text, markup = get_help_menu_content("main")
+        await safe_edit_message(query.message, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    elif action == "act_model":
+        await send_model_picker(chat_id, thread_id, page=0, context=context)
+    elif action == "act_usage":
+        fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
+        try:
+            report_html = await fetch_fn()
+            await safe_send_message(context.bot, chat_id, report_html, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+        except Exception as e:
+            await query.message.reply_text(f"Gagal mengambil kuota: {e}")
+    elif action == "act_status":
+        await status_command(update, context)
+    elif action == "act_reset":
+        await reset_command(update, context)
+    elif action == "act_cancel":
+        await cancel_command(update, context)
 
 
 # ==============================================================================
@@ -1224,6 +1457,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif isinstance(getattr(update.message, "caption", None), str):
             user_text = expand_link_entities(update.message)
 
+    raw_username = getattr(context.bot, "username", "")
+    bot_username = raw_username if isinstance(raw_username, str) else ""
+    user_text = clean_bot_mentions(user_text, bot_username)
+
     if not user_text.strip():
         return
 
@@ -1258,11 +1495,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     """Registers bot commands with Telegram API on startup."""
     commands = [
+        BotCommand("help", "📖 Buka Help Center interaktif"),
+        BotCommand("model", "🤖 Pilih model AI aktif"),
+        BotCommand("topic", "💬 Buat topik baru di private DM"),
+        BotCommand("topics", "📋 Lihat daftar semua topik aktif"),
+        BotCommand("title", "🏷️ Ganti nama topik saat ini"),
+        BotCommand("deletetopic", "🗑️ Hapus topik obrolan saat ini"),
+        BotCommand("sessions", "🗂️ Riwayat sesi percakapan AGY"),
+        BotCommand("resume", "🔄 Lanjutkan sesi percakapan lama"),
+        BotCommand("reset", "✨ Mulai sesi obrolan baru"),
         BotCommand("usage", "📊 Cek kuota model & sisa limit"),
         BotCommand("status", "ℹ️ Status engine, PID, & memori"),
         BotCommand("cancel", "🛑 Hentikan tugas aktif seketika"),
-        BotCommand("reset", "🔄 Mulai sesi percakapan baru"),
-        BotCommand("help", "📖 Panduan bantuan & perintah"),
     ]
     try:
         await application.bot.set_my_commands(commands)
@@ -1317,9 +1561,14 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("model", handle_model_command))
     app.add_handler(CommandHandler("topic", handle_topic_command))
+    app.add_handler(CommandHandler("topics", handle_topics_command))
+    app.add_handler(CommandHandler("title", handle_title_command))
+    app.add_handler(CommandHandler(["deletetopic", "rmtopic"], handle_delete_topic_command))
+    app.add_handler(CommandHandler("sessions", sessions_command))
+    app.add_handler(CommandHandler("resume", resume_command))
     app.add_handler(CommandHandler(["usage", "limit"], usage_command))
     app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler(["reset", "new", "clear"], reset_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
     # Callback Query Handlers (Approval & Model selection)

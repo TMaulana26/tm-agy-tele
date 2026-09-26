@@ -75,6 +75,76 @@ class TestTopics(unittest.IsolatedAsyncioTestCase):
         _, new_name = get_conversation_for_message(chat_id, thread_id)
         self.assertEqual(new_name, call_kwargs["name"])
 
+    async def test_handle_topics_command(self):
+        from tele.topics import handle_topics_command
+        chat_id = 999
+        bind_conversation_to_topic(chat_id, 10, "conv-10", "Fix Login")
+        bind_conversation_to_topic(chat_id, 20, "conv-20", "Update Docker")
+
+        update = MagicMock()
+        update.effective_chat.id = chat_id
+        update.message = MagicMock()
+        update.message.message_thread_id = None
+        update.message.reply_text = AsyncMock()
+
+        context = MagicMock()
+        await handle_topics_command(update, context)
+
+        update.message.reply_text.assert_called_once()
+        reply_content = update.message.reply_text.call_args[0][0]
+        self.assertIn("Fix Login", reply_content)
+        self.assertIn("Update Docker", reply_content)
+
+    async def test_handle_title_command(self):
+        from tele.topics import handle_title_command
+        chat_id = 999
+        thread_id = 55
+        bind_conversation_to_topic(chat_id, thread_id, "conv-55", "Old Title")
+
+        update = MagicMock()
+        update.effective_chat.id = chat_id
+        update.message = MagicMock()
+        update.message.message_thread_id = thread_id
+        update.message.reply_text = AsyncMock()
+
+        context = MagicMock()
+        context.args = ["Brand", "New", "Title"]
+        context.bot = AsyncMock()
+        context.bot.edit_forum_topic = AsyncMock()
+
+        await handle_title_command(update, context)
+
+        context.bot.edit_forum_topic.assert_called_once_with(
+            chat_id=chat_id, message_thread_id=thread_id, name="Brand New Title"
+        )
+        _, updated_name = get_conversation_for_message(chat_id, thread_id)
+        self.assertEqual(updated_name, "Brand New Title")
+
+    async def test_handle_delete_topic_command(self):
+        from tele.topics import handle_delete_topic_command
+        chat_id = 999
+        thread_id = 88
+        bind_conversation_to_topic(chat_id, thread_id, "conv-88", "Temporary Topic")
+
+        update = MagicMock()
+        update.effective_chat.id = chat_id
+        update.message = MagicMock()
+        update.message.message_thread_id = thread_id
+        update.message.reply_text = AsyncMock()
+
+        context = MagicMock()
+        context.bot = AsyncMock()
+        context.bot.delete_forum_topic = AsyncMock()
+
+        await handle_delete_topic_command(update, context)
+
+        context.bot.delete_forum_topic.assert_called_once_with(
+            chat_id=chat_id, message_thread_id=thread_id
+        )
+        conv, name = get_conversation_for_message(chat_id, thread_id)
+        self.assertIsNone(conv)
+        self.assertIsNone(name)
+
 
 if __name__ == "__main__":
     unittest.main()

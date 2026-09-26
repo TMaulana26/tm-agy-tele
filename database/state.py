@@ -124,6 +124,14 @@ class StateDatabase:
                 (str(chat_id), str(thread_id))
             )
 
+    def list_topic_bindings(self, chat_id: Any) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT * FROM telegram_dm_topic_bindings WHERE chat_id = ? ORDER BY updated_at DESC",
+                (str(chat_id),)
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     # --------------------------------------------------------------------------
     # MODEL PREFERENCES
     # --------------------------------------------------------------------------
