@@ -1,0 +1,16 @@
+[Unit]
+Description=Antigravity Telegram Bot (Hermes Parity Engine)
+After=network.target
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{WORKING_DIRECTORY}}
+EnvironmentFile={{WORKING_DIRECTORY}}/.env
+ExecStart={{WORKING_DIRECTORY}}/.venv/bin/python {{WORKING_DIRECTORY}}/bot.py
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
