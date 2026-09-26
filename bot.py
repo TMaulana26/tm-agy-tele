@@ -58,6 +58,7 @@ from config import (
     DEFAULT_MODEL,
     TELEGRAM_FALLBACK_TRANSPORT,
     TELEGRAM_PROXY,
+    AGY_SKIP_PERMISSIONS,
     resolve_workspace_dir,
     get_data_dir,
     build_cli_prompt,
@@ -150,6 +151,16 @@ def is_authorized(update: Update) -> bool:
     if user is None:
         return False
     return user.id in ALLOWED_USER_IDS
+
+
+def get_effective_thread_id(update: Update) -> Optional[int]:
+    """Extracts message_thread_id reliably whether update is Message or CallbackQuery."""
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
+    if msg:
+        tid = getattr(msg, "message_thread_id", None)
+        if isinstance(tid, int):
+            return tid
+    return None
 
 
 async def safe_send_message(
@@ -479,9 +490,10 @@ async def run_agy_cli(
     cmd.extend([
         "-p", full_prompt,
         "--print-timeout", f"{AGY_TIMEOUT_SECONDS}s",
-        "--dangerously-skip-permissions",
-        "--output-format", "json"
     ])
+    if AGY_SKIP_PERMISSIONS:
+        cmd.append("--dangerously-skip-permissions")
+    cmd.extend(["--output-format", "json"])
 
     env = os.environ.copy()
     extra_paths = [
@@ -640,7 +652,10 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
             "💡 <i>Tiap topik memiliki memori percakapan independen tanpa mencemari topik lain!</i>"
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+            [
+                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
+                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
+            ]
         ])
         return text, keyboard
 
@@ -655,7 +670,10 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
             "💡 <i>Gunakan /reset bila model mulai keluar konteks atau ingin memulai tugas baru.</i>"
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+            [
+                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
+                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
+            ]
         ])
         return text, keyboard
 
@@ -668,7 +686,10 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
             "• <b>Media Guard</b>: Pengiriman file sensitif (<code>.env</code>, <code>state.db</code>, <code>auth.json</code>, SSH keys) dilarang secara ketat."
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+            [
+                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
+                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
+            ]
         ])
         return text, keyboard
 
@@ -681,7 +702,10 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
             "• <code>/cancel</code> — Hentikan eksekusi perintah yang sedang berjalan."
         )
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main")]
+            [
+                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
+                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
+            ]
         ])
         return text, keyboard
 
@@ -708,6 +732,9 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
         [
             InlineKeyboardButton("ℹ️ Status Engine", callback_data="help:act_status"),
             InlineKeyboardButton("✨ Sesi Baru", callback_data="help:act_reset")
+        ],
+        [
+            InlineKeyboardButton("✖️ Tutup Bantuan", callback_data="help:close")
         ]
     ])
     return text, keyboard
@@ -718,8 +745,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     text, reply_markup = get_help_menu_content("main")
     await safe_send_message(
@@ -737,8 +763,7 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     status_msg = await safe_send_message(
         context.bot,
@@ -749,19 +774,25 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
+    usage_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="usage_refresh"),
+            InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
+        ]
+    ])
     try:
         report_html = await fetch_fn()
         if status_msg:
-            await safe_edit_message(status_msg, report_html, parse_mode=ParseMode.HTML)
+            await safe_edit_message(status_msg, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
         else:
-            await safe_send_message(context.bot, chat_id, report_html, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+            await safe_send_message(context.bot, chat_id, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
     except Exception as e:
         logger.error(f"Error handling /usage: {e}", exc_info=True)
         err_msg = f"❌ Gagal mengambil data kuota:\n<code>{html.escape(str(e))}</code>"
         if status_msg:
-            await safe_edit_message(status_msg, err_msg, parse_mode=ParseMode.HTML)
+            await safe_edit_message(status_msg, err_msg, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
         else:
-            await safe_send_message(context.bot, chat_id, err_msg, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+            await safe_send_message(context.bot, chat_id, err_msg, reply_markup=usage_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -770,8 +801,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     db = get_db()
     current_conv = None
@@ -802,7 +832,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• **Whitelist User ID**: `{user_id}` (Terverifikasi)\n"
         f"• **Pending Approvals**: `{len(pending_approvals)}`"
     )
-    await safe_send_message(context.bot, chat_id, status_text, parse_mode=ParseMode.MARKDOWN, message_thread_id=thread_id)
+    status_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🤖 Ganti Model", callback_data="help:act_model"),
+            InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
+        ]
+    ])
+    await safe_send_message(context.bot, chat_id, status_text, reply_markup=status_kb, parse_mode=ParseMode.MARKDOWN, message_thread_id=thread_id)
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -811,8 +847,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     # 1. Hentikan proses yang sedang berjalan
     proc = user_processes.get(user_id)
@@ -842,12 +877,18 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if fut and not fut.done():
                 fut.cancel()
 
+    reset_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
+        ]
+    ])
     await safe_send_message(
         context.bot,
         chat_id,
         "🔄 **Sesi Percakapan Direset!**\n"
         f"Riwayat percakapan lama ({old_conv[:8] + '...' if old_conv else 'None'}) telah dibersihkan. "
         "Instruksi berikutnya akan memulai percakapan baru di `agy`.",
+        reply_markup=reset_kb,
         parse_mode=ParseMode.MARKDOWN,
         message_thread_id=thread_id
     )
@@ -860,8 +901,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     db = get_db()
     current_conv = None
@@ -900,13 +940,14 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     discovered.sort(key=lambda x: x[0], reverse=True)
     recent = discovered[:8]
 
+    close_kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")]])
     if not recent:
         msg = (
             "🗂️ <b>Riwayat Sesi Antigravity:</b>\n\n"
             "Belum ada sesi percakapan yang ditemukan pada host ini.\n"
             f"Sesi aktif saat ini: <code>{current_conv or 'Fresh / Belum dimulai'}</code>"
         )
-        await safe_send_message(context.bot, chat_id, msg, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+        await safe_send_message(context.bot, chat_id, msg, reply_markup=close_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
         return
 
     lines = ["🗂️ <b>Daftar Sesi Percakapan Antigravity Terbaru:</b>\n"]
@@ -916,7 +957,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{idx}. <code>{cid}</code> ({rel_time}){is_active}")
 
     lines.append("\n💡 <i>Gunakan perintah:</i> <code>/resume &lt;id_sesi&gt;</code> <i>untuk berpindah ke sesi tersebut.</i>")
-    await safe_send_message(context.bot, chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+    await safe_send_message(context.bot, chat_id, "\n".join(lines), reply_markup=close_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
 
 
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -926,8 +967,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     args = context.args if context.args else []
     target_id = args[0].strip() if args else ""
@@ -967,8 +1007,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
     cancelled_anything = False
 
     proc = user_processes.get(user_id)
@@ -1035,6 +1074,29 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_model_callback(update, context)
     elif data.startswith("help:"):
         await handle_help_callback(update, context)
+    elif data == "msg_close":
+        await query.answer()
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+    elif data == "usage_refresh":
+        await query.answer("Memperbarui data kuota...")
+        fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
+        try:
+            report_html = await fetch_fn()
+            usage_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data="usage_refresh"),
+                    InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
+                ]
+            ])
+            await safe_edit_message(query.message, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await query.answer(f"Gagal refresh: {e}", show_alert=True)
 
 
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1046,8 +1108,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     action = query.data.split(":", 1)[1]
     chat_id = query.message.chat_id
-    raw_thread = getattr(query.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     if action.startswith("cat_"):
         category = action[4:]
@@ -1056,15 +1117,29 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     elif action == "main":
         text, markup = get_help_menu_content("main")
         await safe_edit_message(query.message, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+    elif action == "close":
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
     elif action == "act_model":
         await send_model_picker(chat_id, thread_id, page=0, context=context)
     elif action == "act_usage":
         fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
         try:
             report_html = await fetch_fn()
-            await safe_send_message(context.bot, chat_id, report_html, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+            usage_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data="usage_refresh"),
+                    InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
+                ]
+            ])
+            await safe_send_message(context.bot, chat_id, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
         except Exception as e:
-            await query.message.reply_text(f"Gagal mengambil kuota: {e}")
+            await safe_send_message(context.bot, chat_id, f"❌ Gagal mengambil kuota: {e}", message_thread_id=thread_id)
     elif action == "act_status":
         await status_command(update, context)
     elif action == "act_reset":

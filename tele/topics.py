@@ -12,7 +12,7 @@ import re
 import uuid
 import logging
 from typing import Optional, Tuple, Dict, Any
-from telegram import Update, Bot
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -140,7 +140,8 @@ async def handle_topics_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     lines.append("\n💡 <i>Gunakan <code>/title [nama]</code> untuk ganti nama, atau <code>/deletetopic</code> untuk menghapus topik aktif.</i>")
     if update.message:
-        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        close_kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")]])
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=close_kb)
 
 
 async def handle_title_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

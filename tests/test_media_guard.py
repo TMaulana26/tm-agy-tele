@@ -59,12 +59,18 @@ class TestMediaGuard(unittest.TestCase):
             self.assertFalse(is_valid)
 
     def test_secret_patterns_blocked(self):
+        (self.ws / ".config").mkdir(exist_ok=True)
+        (self.ws / ".git").mkdir(exist_ok=True)
         secret_candidates = [
             self.ws / ".env",
             self.ws / ".env.production",
             self.ws / "state.db",
             self.ws / "id_rsa",
             self.ws / "credentials.json",
+            self.ws / ".bash_history",
+            self.ws / ".bashrc",
+            self.ws / ".config" / "token.json",
+            self.ws / ".git" / "config",
         ]
         for s in secret_candidates:
             s.write_text("secret")

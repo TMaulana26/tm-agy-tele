@@ -38,11 +38,16 @@ FORBIDDEN_FILE_PATTERNS = [
     r"[\\/]\.ssh[\\/]",
     r"[\\/]\.aws[\\/]",
     r"[\\/]\.gnupg[\\/]",
-    r"[\\/]\.gemini[\\/].*auth.*\.json",
+    r"[\\/]\.gemini[\\/]",
     r"[\\/]\.env(?:\..*)?$",
     r"[\\/].*\.db$",
     r"[\\/]id_rsa(?:\.pub)?$",
     r"[\\/]credentials\.json$",
+    r"[\\/]\..*history$",
+    r"[\\/]\.bash.*",
+    r"[\\/]\.profile$",
+    r"[\\/]\.config[\\/]",
+    r"[\\/]\.git[\\/]",
 ]
 
 

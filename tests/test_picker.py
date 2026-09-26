@@ -22,8 +22,8 @@ class TestModelPicker(unittest.IsolatedAsyncioTestCase):
         active = "claude-sonnet-4-6"
         kb = build_model_keyboard(models, active, page=0)
 
-        # 3 model rows + 1 navigation row
-        self.assertEqual(len(kb.inline_keyboard), 4)
+        # 3 model rows + 1 navigation row + 1 close button row
+        self.assertEqual(len(kb.inline_keyboard), 5)
 
         # Active model should have checkmark
         claude_btn = kb.inline_keyboard[1][0]
@@ -33,6 +33,11 @@ class TestModelPicker(unittest.IsolatedAsyncioTestCase):
         # Inactive model should not have checkmark
         gemini_btn = kb.inline_keyboard[0][0]
         self.assertFalse(gemini_btn.text.startswith("✓"))
+
+        # Close button row
+        close_btn = kb.inline_keyboard[4][0]
+        self.assertEqual(close_btn.callback_data, "model_close")
+        self.assertIn("Tutup", close_btn.text)
 
     async def test_fetch_available_models_fallback_on_error(self):
         with patch("asyncio.create_subprocess_exec", side_effect=Exception("binary error")):

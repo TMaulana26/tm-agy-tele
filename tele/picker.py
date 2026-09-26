@@ -80,11 +80,14 @@ def build_model_keyboard(
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton("◀ Sebelumnya", callback_data=f"model_page:{page - 1}"))
-    nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="model_noop"))
+    nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data=f"model_noop:{page + 1}:{total_pages}"))
     if page < total_pages - 1:
         nav_row.append(InlineKeyboardButton("Selanjutnya ▶", callback_data=f"model_page:{page + 1}"))
 
     keyboard.append(nav_row)
+    keyboard.append([
+        InlineKeyboardButton("✖️ Tutup Menu", callback_data="model_close")
+    ])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -165,41 +168,85 @@ async def send_model_picker(
 
 
 async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles pagination and selection clicks in the /model picker."""
+    """Handles pagination, selection, reopening, and dismiss clicks in the /model picker."""
     query = update.callback_query
     if not query or not query.data:
         return
 
-    await query.answer()
     data = query.data
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat:
         return
 
-    thread_id = getattr(query.message, "message_thread_id", None) or "root"
+    raw_thread = getattr(query.message, "message_thread_id", None)
+    thread_id = raw_thread if isinstance(raw_thread, int) else "root"
     db = get_db()
     models = await fetch_available_models()
 
-    if data.startswith("model_page:"):
+    if data.startswith("model_noop"):
+        parts = data.split(":")
+        if len(parts) >= 3:
+            await query.answer(f"Halaman {parts[1]} dari {parts[2]}", show_alert=False)
+        else:
+            await query.answer("Indikator Halaman", show_alert=False)
+        return
+
+    await query.answer()
+
+    if data == "model_close":
+        try:
+            await query.message.delete()
+        except Exception:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        return
+
+    elif data.startswith("model_reopen"):
+        parts = data.split(":")
+        page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        current_model = db.get_user_model(user.id, chat.id, thread_id) or DEFAULT_MODEL
+        kb = build_model_keyboard(models, current_model, page=page)
+        model_name = next((m['name'] for m in models if m['id'] == current_model), current_model)
+        await query.edit_message_text(
+            f"🤖 **Pilih Model AI untuk Sesi Ini:**\n"
+            f"Model saat ini: `{model_name}`\n\n"
+            f"_Klik tombol di bawah untuk mengganti model:_",
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data.startswith("model_page:"):
         page = int(data.split(":")[1])
         current_model = db.get_user_model(user.id, chat.id, thread_id) or DEFAULT_MODEL
         kb = build_model_keyboard(models, current_model, page=page)
         await query.edit_message_reply_markup(reply_markup=kb)
 
     elif data.startswith("model_set:"):
-        new_model_id = data.split(":", 1)[1]
+        parts = data.split(":")
+        new_model_id = parts[1]
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+
         db.set_user_model(user.id, chat.id, new_model_id, thread_id)
         matched = next((m for m in models if m["id"] == new_model_id), None)
         model_name = matched["name"] if matched else new_model_id
 
-        # Update keyboard with new checkmark
-        kb = build_model_keyboard(models, new_model_id, page=0)
+        # Clean confirmation markup with Reopen & Close buttons - NO dangling full lists!
+        confirm_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔄 Ganti Model Lain", callback_data=f"model_reopen:{page}"),
+                InlineKeyboardButton("✖️ Selesai", callback_data="model_close")
+            ]
+        ])
+
+        scope_label = "Topik Ini" if (thread_id != "root" and thread_id is not None) else "Global / Root DM"
         await query.edit_message_text(
             f"✅ **Model Aktif Telah Diperbarui!**\n\n"
             f"• **Model**: `{model_name}`\n"
-            f"• **Lingkup**: `{'Topik Ini' if thread_id != 'root' else 'Global / Root DM'}`\n\n"
+            f"• **Lingkup**: `{scope_label}`\n\n"
             f"_Instruksi Anda selanjutnya akan diproses menggunakan model ini._",
-            reply_markup=kb,
+            reply_markup=confirm_kb,
             parse_mode=ParseMode.MARKDOWN
         )

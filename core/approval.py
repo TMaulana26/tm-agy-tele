@@ -137,7 +137,7 @@ async def request_user_approval(
         status_label = "✅ **DISETUJUI (APPROVED)**" if approved else "❌ **DITOLAK (DENIED)**"
         if msg:
             try:
-                await msg.edit_text(f"{pesan_approval}\n\nStatus: {status_label}", parse_mode=ParseMode.MARKDOWN)
+                await msg.edit_text(f"{pesan_approval}\n\nStatus: {status_label}", reply_markup=None, parse_mode=ParseMode.MARKDOWN)
             except Exception:
                 pass
         return approved
@@ -147,6 +147,7 @@ async def request_user_approval(
             try:
                 await msg.edit_text(
                     f"{pesan_approval}\n\nStatus: ⏱️ **KADALUWARSA (TIMEOUT - DITOLAK OTOMATIS)**",
+                    reply_markup=None,
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception:
@@ -158,6 +159,7 @@ async def request_user_approval(
             try:
                 await msg.edit_text(
                     f"{pesan_approval}\n\nStatus: 🛑 **DIBATALKAN VIA /cancel**",
+                    reply_markup=None,
                     parse_mode=ParseMode.MARKDOWN
                 )
             except Exception:
@@ -168,20 +170,36 @@ async def request_user_approval(
 
 
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles clicks on the [Approve] / [Deny] inline buttons."""
+    """Handles clicks on the [Approve] / [Deny] inline buttons with strict user authorization."""
     query = update.callback_query
     if query is None or not query.data:
         return
 
-    await query.answer()
     data = query.data
     action, _, request_id = data.partition(":")
 
-    if request_id in pending_approvals:
-        entry = pending_approvals[request_id]
-        future = entry.get("future")
-        if future and not future.done():
-            if action == "appr":
-                future.set_result(True)
-            elif action == "deny":
-                future.set_result(False)
+    if request_id not in pending_approvals:
+        await query.answer("⚠️ Permintaan persetujuan ini sudah selesai atau kadaluwarsa.", show_alert=True)
+        return
+
+    entry = pending_approvals[request_id]
+    target_user_id = entry.get("user_id")
+
+    # Defense-in-depth: Verify that the user who clicked is the authorized initiator
+    clicker_id = None
+    if getattr(query, "from_user", None) is not None and isinstance(getattr(query.from_user, "id", None), int):
+        clicker_id = query.from_user.id
+    elif update.effective_user and isinstance(getattr(update.effective_user, "id", None), int):
+        clicker_id = update.effective_user.id
+
+    if clicker_id is not None and target_user_id is not None and clicker_id != target_user_id:
+        await query.answer("⛔ Anda tidak memiliki wewenang untuk menyetujui perintah ini.", show_alert=True)
+        return
+
+    await query.answer()
+    future = entry.get("future")
+    if future and not future.done():
+        if action == "appr":
+            future.set_result(True)
+        elif action == "deny":
+            future.set_result(False)

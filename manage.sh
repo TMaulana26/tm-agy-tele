@@ -9,6 +9,7 @@ set -e
 SERVICE_NAME="tm-agy-tele"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+[ -f "$SCRIPT_DIR/.env" ] && chmod 600 "$SCRIPT_DIR/.env" 2>/dev/null || true
 
 # Colors
 GREEN='\033[0;32m'

@@ -22,6 +22,7 @@ from config import (
     WORKSPACE_DIR,
     AGY_TIMEOUT_SECONDS,
     DEFAULT_MODEL,
+    AGY_SKIP_PERMISSIONS,
     build_cli_prompt,
 )
 
@@ -163,9 +164,10 @@ async def run_agy_cli(
     cmd.extend([
         "-p", full_prompt,
         "--print-timeout", f"{AGY_TIMEOUT_SECONDS}s",
-        "--dangerously-skip-permissions",
-        "--output-format", "json"
     ])
+    if AGY_SKIP_PERMISSIONS:
+        cmd.append("--dangerously-skip-permissions")
+    cmd.extend(["--output-format", "json"])
 
     env = os.environ.copy()
     extra_paths = [

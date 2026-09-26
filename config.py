@@ -42,24 +42,28 @@ DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gemini-3.8-flash-high").strip()
 def resolve_workspace_dir() -> str:
     """
     Validates and resolves the primary workspace directory.
-    Fallback priority: env WORKSPACE_DIR -> /home/ubuntu -> user home -> cwd.
+    Fallback priority: env WORKSPACE_DIR -> user home / projects -> cwd / workspace.
+    NEVER falls back directly to the root of /home/ubuntu or root home directory
+    to prevent unintended media leaks of sensitive user dotfiles (.bash_history, .config, etc.).
     """
     raw = os.getenv("WORKSPACE_DIR", "").strip()
     if raw and os.path.exists(raw) and os.path.isdir(raw):
         return raw
 
-    if os.path.isdir("/home/ubuntu"):
-        if raw and raw != "/home/ubuntu":
-            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan fallback: /home/ubuntu")
-        return "/home/ubuntu"
-
+    # Safe isolated subfolder fallback
     home = Path.home()
-    if home.is_dir():
-        if raw and raw != str(home):
-            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan fallback home: {home}")
-        return str(home)
-
-    return os.getcwd()
+    safe_projects = home / "projects"
+    try:
+        safe_projects.mkdir(parents=True, exist_ok=True)
+        if raw and raw != str(safe_projects):
+            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan folder terisolasi: {safe_projects}")
+        return str(safe_projects)
+    except Exception:
+        fallback_cwd = Path.cwd() / "workspace"
+        fallback_cwd.mkdir(parents=True, exist_ok=True)
+        if raw and raw != str(fallback_cwd):
+            logger.warning(f"WORKSPACE_DIR '{raw}' tidak ditemukan. Menggunakan folder terisolasi: {fallback_cwd}")
+        return str(fallback_cwd)
 
 WORKSPACE_DIR: str = resolve_workspace_dir()
 
@@ -81,6 +85,7 @@ def get_data_dir() -> Path:
 APPROVAL_MODE: str = os.getenv("APPROVAL_MODE", "ask_destructive").strip().lower()
 APPROVAL_TIMEOUT_SECONDS: int = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120"))
 AGY_TIMEOUT_SECONDS: int = int(os.getenv("AGY_TIMEOUT_SECONDS", "180"))
+AGY_SKIP_PERMISSIONS: bool = os.getenv("AGY_SKIP_PERMISSIONS", "true").strip().lower() in ("true", "1", "yes")
 
 # ==============================================================================
 # NETWORK & RESILIENCE
@@ -100,7 +105,7 @@ SYSTEM_INSTRUCTIONS: str = (
     "ATURAN OPERASIONAL PENTING:\n"
     "1. Anda berjalan dalam sesi headless non-interaktif (print mode).\n"
     "2. JANGAN PERNAH menggunakan tool internal `schedule` untuk recurring cron atau background timers. "
-    "Jika pengguna meminta cron job atau penjadwalan otomatis, selalu buat script dan pasang langsung ke crontab Linux host via terminal (`crontab`).\n"
+    "Jika pengguna meminta cron job atau penjadwalan otomatis, buat script yang relevan dan tanyakan/konfirmasi kepada pengguna sebelum memasang ke crontab host.\n"
     "3. Selalu selesaikan eksekusi perintah terminal sebelum mengakhiri giliran Anda."
 )
 

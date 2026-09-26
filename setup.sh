@@ -106,6 +106,7 @@ update_env_var() {
 
 if [ ! -f "$SCRIPT_DIR/.env" ]; then
     cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+    chmod 600 "$SCRIPT_DIR/.env" 2>/dev/null || true
     echo -e "${YELLOW}   File .env baru disalin dari .env.example.${NC}"
 fi
 
@@ -123,11 +124,14 @@ if [ -z "$DETECTED_AGY" ]; then
     DETECTED_AGY="$HOME/.local/bin/agy"
 fi
 
-# Detect workspace path
-DETECTED_WS="$HOME"
-if [ "$DETECTED_WS" = "/root" ] && [ -d "/home/ubuntu" ]; then
-    DETECTED_WS="/home/ubuntu"
+# Detect workspace path (strictly isolated projects subfolder, never root home)
+DETECTED_WS="$HOME/projects"
+if [ "$HOME" = "/root" ] && [ -d "/home/ubuntu" ]; then
+    DETECTED_WS="/home/ubuntu/projects"
+elif [ -d "/home/apps/projects" ]; then
+    DETECTED_WS="/home/apps/projects"
 fi
+mkdir -p "$DETECTED_WS" 2>/dev/null || true
 
 CURRENT_TOKEN=$(grep -E "^TELEGRAM_BOT_TOKEN=" "$SCRIPT_DIR/.env" | cut -d '=' -f2- | tr -d '"' | tr -d "'" || echo "")
 CURRENT_USER_ID=$(grep -E "^ALLOWED_USER_ID=" "$SCRIPT_DIR/.env" | cut -d '=' -f2- | tr -d '"' | tr -d "'" || echo "")
@@ -149,14 +153,22 @@ if [ -t 0 ] && { [ -z "$CURRENT_TOKEN" ] || [ "$CURRENT_TOKEN" = "$PLACEHOLDER_T
 
     echo ""
     echo -e "Dapatkan ID akun Anda dari ${CYAN}@userinfobot${NC} di Telegram."
-    read -rp "👉 Masukkan ALLOWED_USER_ID (ID Telegram Akang) [${CURRENT_USER_ID:-7163641352}]: " INPUT_USER_ID
-    INPUT_USER_ID="${INPUT_USER_ID:-${CURRENT_USER_ID:-7163641352}}"
+    if [ -n "$CURRENT_USER_ID" ]; then
+        read -rp "👉 Masukkan ALLOWED_USER_ID (ID Telegram Akang) [${CURRENT_USER_ID}]: " INPUT_USER_ID
+        INPUT_USER_ID="${INPUT_USER_ID:-$CURRENT_USER_ID}"
+    else
+        read -rp "👉 Masukkan ALLOWED_USER_ID (ID Telegram Akang): " INPUT_USER_ID
+        while [ -z "$INPUT_USER_ID" ]; do
+            read -rp "👉 Masukkan ALLOWED_USER_ID (wajib diisi): " INPUT_USER_ID
+        done
+    fi
     update_env_var "ALLOWED_USER_ID" "$INPUT_USER_ID"
 
     update_env_var "AGY_BIN_PATH" "$DETECTED_AGY"
     update_env_var "WORKSPACE_DIR" "$DETECTED_WS"
     update_env_var "DEFAULT_MODEL" "gemini-3.8-flash-high"
-    echo -e "${GREEN}   ✓ Konfigurasi disimpan ke .env${NC}"
+    chmod 600 "$SCRIPT_DIR/.env" 2>/dev/null || true
+    echo -e "${GREEN}   ✓ Konfigurasi disimpan ke .env (chmod 600 enforced)${NC}"
     echo -e "${MAGENTA}----------------------------------------------------------------${NC}"
     echo ""
 else
@@ -167,6 +179,7 @@ else
     if ! grep -q "^WORKSPACE_DIR=" "$SCRIPT_DIR/.env"; then
         update_env_var "WORKSPACE_DIR" "$DETECTED_WS"
     fi
+    chmod 600 "$SCRIPT_DIR/.env" 2>/dev/null || true
 fi
 
 # ------------------------------------------------------------------------------
