@@ -84,7 +84,7 @@ def get_data_dir() -> Path:
 # ==============================================================================
 APPROVAL_MODE: str = os.getenv("APPROVAL_MODE", "ask_destructive").strip().lower()
 APPROVAL_TIMEOUT_SECONDS: int = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120"))
-AGY_TIMEOUT_SECONDS: int = int(os.getenv("AGY_TIMEOUT_SECONDS", "180"))
+AGY_TIMEOUT_SECONDS: int = int(os.getenv("AGY_TIMEOUT_SECONDS", "300"))
 AGY_SKIP_PERMISSIONS: bool = os.getenv("AGY_SKIP_PERMISSIONS", "true").strip().lower() in ("true", "1", "yes")
 
 # ==============================================================================

@@ -586,6 +586,32 @@ docker ps -a
                 call_kwargs = mock_status_msg.edit_text.call_args.kwargs
                 self.assertIn("Laporan Kuota Intercepted", call_kwargs.get("text", ""))
 
+    async def test_handle_message_with_reply_to_message_context(self):
+        update = MagicMock()
+        update.effective_user.id = 111111
+        update.effective_chat.id = 111111
+        update.message.text = "Coba ini lagi kang"
+        update.message.caption = None
+        update.message.entities = []
+
+        reply = MagicMock()
+        reply.text = "Coba cek security dari repo tm-agy-tele kang"
+        reply.caption = None
+        reply.document = None
+        reply.photo = None
+        reply.from_user.first_name = "Ta Ma"
+        reply.from_user.is_bot = False
+        update.message.reply_to_message = reply
+
+        context = MagicMock()
+        with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
+            await bot.handle_message(update, context)
+            mock_dispatch.assert_called_once()
+            dispatched_prompt = mock_dispatch.call_args[0][2]
+            self.assertIn("[MEMBALAS PESAN TA MA]:", dispatched_prompt)
+            self.assertIn("> Coba cek security dari repo tm-agy-tele kang", dispatched_prompt)
+            self.assertIn("[PESAN TERBARU PENGGUNA]:\nCoba ini lagi kang", dispatched_prompt)
+
     # --------------------------------------------------------------------------
     # 11. HEADLESS RESILIENCE & SUBPROCESS TIMEOUT RECOVERY
     # --------------------------------------------------------------------------

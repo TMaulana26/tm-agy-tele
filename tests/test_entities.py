@@ -4,7 +4,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from tele.entities import expand_link_entities, clean_bot_mentions
+from tele.entities import expand_link_entities, clean_bot_mentions, format_reply_context
 
 
 class TestEntities(unittest.TestCase):
@@ -47,6 +47,58 @@ class TestEntities(unittest.TestCase):
         self.assertEqual(clean_bot_mentions("@antigravity_bot buatkan script", "antigravity_bot"), "buatkan script")
         self.assertEqual(clean_bot_mentions("Halo @my_bot periksa log"), "Halo  periksa log".strip())
         self.assertEqual(clean_bot_mentions("tidak ada mention"), "tidak ada mention")
+
+    def test_format_reply_context_text(self):
+        msg = MagicMock()
+        msg.reply_to_message = MagicMock()
+        msg.reply_to_message.text = "Coba cek security dari repo tm-agy-tele kang"
+        msg.reply_to_message.caption = None
+        msg.reply_to_message.document = None
+        msg.reply_to_message.photo = None
+        msg.reply_to_message.from_user.first_name = "Ta Ma"
+        msg.reply_to_message.from_user.is_bot = False
+
+        res = format_reply_context(msg, "Coba ini lagi kang")
+        self.assertIn("[MEMBALAS PESAN TA MA]:", res)
+        self.assertIn("> Coba cek security dari repo tm-agy-tele kang", res)
+        self.assertIn("[PESAN TERBARU PENGGUNA]:\nCoba ini lagi kang", res)
+
+    def test_format_reply_context_bot(self):
+        msg = MagicMock()
+        msg.reply_to_message = MagicMock()
+        msg.reply_to_message.text = "Berikut adalah hasil audit kode."
+        msg.reply_to_message.caption = None
+        msg.reply_to_message.document = None
+        msg.reply_to_message.photo = None
+        msg.reply_to_message.from_user.first_name = "Bot"
+        msg.reply_to_message.from_user.is_bot = True
+
+        res = format_reply_context(msg, "Tolong perbaiki bagian nomor 2")
+        self.assertIn("[MEMBALAS PESAN ASISTEN (BOT)]:", res)
+        self.assertIn("> Berikut adalah hasil audit kode.", res)
+        self.assertIn("Tolong perbaiki bagian nomor 2", res)
+
+    def test_format_reply_context_document(self):
+        msg = MagicMock()
+        msg.reply_to_message = MagicMock()
+        msg.reply_to_message.text = None
+        msg.reply_to_message.caption = None
+        doc = MagicMock()
+        doc.file_name = "server.log"
+        msg.reply_to_message.document = doc
+        msg.reply_to_message.photo = None
+        msg.reply_to_message.from_user.first_name = "Dimas"
+        msg.reply_to_message.from_user.is_bot = False
+
+        res = format_reply_context(msg, "Analisis file ini")
+        self.assertIn("[MEMBALAS PESAN DIMAS]:", res)
+        self.assertIn("[Berkas Terlampir: server.log]", res)
+
+    def test_format_reply_context_no_reply(self):
+        msg = MagicMock()
+        msg.reply_to_message = None
+        res = format_reply_context(msg, "Halo kang")
+        self.assertEqual(res, "Halo kang")
 
 
 if __name__ == "__main__":

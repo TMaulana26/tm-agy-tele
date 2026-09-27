@@ -83,3 +83,54 @@ def clean_bot_mentions(text: Optional[str], bot_username: str = "") -> str:
     else:
         clean = re.sub(r"@[a-zA-Z0-9_]+bot\b", "", text, flags=re.IGNORECASE)
     return clean.strip()
+
+
+def format_reply_context(message: Any, current_text: str) -> str:
+    """
+    Extracts replied-to message context and prepends it to the user's prompt.
+    Supports replied text, caption, document name, or photo indicator.
+    """
+    reply_msg = getattr(message, "reply_to_message", None)
+    if not reply_msg:
+        return current_text
+
+    sender = "PENGGUNA"
+    from_user = getattr(reply_msg, "from_user", None)
+    if from_user:
+        if getattr(from_user, "is_bot", False):
+            sender = "ASISTEN (BOT)"
+        elif getattr(from_user, "first_name", None):
+            sender = from_user.first_name.upper()
+
+    reply_body = (
+        getattr(reply_msg, "text", None)
+        or getattr(reply_msg, "caption", None)
+        or ""
+    )
+
+    doc = getattr(reply_msg, "document", None)
+    doc_name = getattr(doc, "file_name", None) if doc else None
+    photo = getattr(reply_msg, "photo", None)
+
+    quoted_parts = []
+    if reply_body.strip():
+        trimmed = reply_body.strip()
+        if len(trimmed) > 1000:
+            trimmed = trimmed[:1000] + "..."
+        quoted_lines = "\n".join(f"> {line}" for line in trimmed.splitlines())
+        quoted_parts.append(quoted_lines)
+    elif doc_name:
+        quoted_parts.append(f"> [Berkas Terlampir: {doc_name}]")
+    elif photo:
+        quoted_parts.append("> [Foto / Gambar Terlampir]")
+
+    if not quoted_parts:
+        return current_text
+
+    quoted_block = "\n".join(quoted_parts)
+    return (
+        f"[MEMBALAS PESAN {sender}]:\n"
+        f"{quoted_block}\n\n"
+        f"[PESAN TERBARU PENGGUNA]:\n"
+        f"{current_text}"
+    )

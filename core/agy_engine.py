@@ -52,10 +52,24 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
     candidate_bases.extend([
         home / ".gemini" / "antigravity-cli" / "brain",
         home / ".gemini" / "antigravity" / "brain",
+        home / ".gemini" / "brain",
         Path("/home/ubuntu/.gemini/antigravity-cli/brain"),
         Path("/home/ubuntu/.gemini/antigravity/brain"),
+        Path("/home/ubuntu/.gemini/brain"),
+        Path("/root/.gemini/brain"),
         Path(WORKSPACE_DIR) / ".gemini" / "brain",
     ])
+
+    # Dynamic recursive scan under ~/.gemini for any brain folders
+    search_parents = [home / ".gemini", Path("/home/ubuntu/.gemini"), Path(WORKSPACE_DIR) / ".gemini"]
+    for sp in search_parents:
+        if sp.is_dir():
+            try:
+                for b_dir in sp.glob("**/brain"):
+                    if b_dir.is_dir() and b_dir not in candidate_bases:
+                        candidate_bases.append(b_dir)
+            except Exception:
+                pass
 
     valid_bases = [b for b in candidate_bases if b.is_dir()]
 
@@ -66,7 +80,28 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
                 return cand, conv_id
         return None, conv_id
 
-    # Fallback to newest conversation folder
+    # Fallback to newest conversation folder: prioritize current workspace first
+    ws_brain = Path(WORKSPACE_DIR) / ".gemini" / "brain"
+    if ws_brain.is_dir():
+        ws_newest_file = None
+        ws_newest_mtime = -1.0
+        ws_conv_id = None
+        try:
+            for item in ws_brain.iterdir():
+                if item.is_dir():
+                    cand = item / ".system_generated" / "logs" / "transcript.jsonl"
+                    if cand.is_file():
+                        mtime = cand.stat().st_mtime
+                        if mtime > ws_newest_mtime:
+                            ws_newest_mtime = mtime
+                            ws_newest_file = cand
+                            ws_conv_id = item.name
+            if ws_newest_file and ws_conv_id:
+                return ws_newest_file, ws_conv_id
+        except Exception as e:
+            logger.debug(f"Error checking workspace brain dir {ws_brain}: {e}")
+
+    # Fallback to newest conversation folder across all candidate bases
     newest_file: Optional[Path] = None
     newest_mtime = -1.0
     found_conv_id: Optional[str] = None
@@ -311,8 +346,14 @@ async def run_agy_cli(
         else:
             dur_str = f" ({duration:.1f}s)" if isinstance(duration, (int, float)) else ""
             turns_str = f" ({num_turns} turns)" if isinstance(num_turns, int) and num_turns > 1 else ""
+            timeout_hint = ""
+            if isinstance(duration, (int, float)) and duration >= (AGY_TIMEOUT_SECONDS - 5):
+                timeout_hint = (
+                    f"\n\n⏱️ *Catatan:* Proses selesai di batas waktu `{AGY_TIMEOUT_SECONDS}s`. "
+                    f"Jika tugas membutuhkan analisis lebih panjang, perbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`."
+                )
             return (
-                f"✅ **Tugas Selesai!** Antigravity telah menyelesaikan seluruh langkah eksekusi di latar belakang{dur_str}{turns_str}, namun tidak ada pesan balasan teks langsung.",
+                f"✅ **Tugas Selesai!** Antigravity telah menyelesaikan seluruh langkah eksekusi di latar belakang{dur_str}{turns_str}, namun tidak ada pesan balasan teks langsung.{timeout_hint}",
                 ret_conv
             )
 
