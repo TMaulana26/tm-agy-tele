@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --help,  -h             Tampilkan panduan bantuan ini"
             echo ""
             echo -e "${BOLD}Contoh:${NC}"
-            echo "  ./deploy.sh --token \"123456:ABC...\" --user \"7163641352\""
+            echo "  ./deploy.sh --token \"123456:ABC...\" --user \"123456789\""
             echo "  ./deploy.sh --systemd"
             echo "  ./deploy.sh --docker"
             exit 0
@@ -176,7 +176,7 @@ if [ "$DEPLOY_MODE" = "systemd" ] && { [ "$CURRENT_WORKSPACE" = "/workspace" ] |
 fi
 
 PLACEHOLDER_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
-PLACEHOLDER_USER="7163641352"
+PLACEHOLDER_USER="123456789"
 
 # Interactive prompt if values are missing or placeholder
 IS_INTERACTIVE=false

@@ -80,7 +80,7 @@ TELEGRAM_BOT_TOKEN="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"
 
 # ID Telegram Akang (HANYA ID ini yang diizinkan berinteraksi dengan bot)
 # Dapatkan ID via bot @userinfobot di Telegram
-ALLOWED_USER_ID="7163641352"
+ALLOWED_USER_ID="123456789"
 
 # ==============================================================================
 # APPROVAL & SANDBOX SETTINGS (ALA HERMES)
@@ -560,7 +560,7 @@ Panduan ini ditujukan untuk VPS berbasis **Linux (Ubuntu 22.04 / 24.04 LTS atau 
 3. Beri nama bot (misal: `Kang Antigravity VPS`).
 4. Beri username bot yang diakhiri `_bot` (misal: `kang_agy_vps_bot`).
 5. Catat **HTTP API Token** yang diberikan oleh BotFather.
-6. Cari tahu User ID Telegram Akang dengan membuka **`@userinfobot`** di Telegram, lalu catat angka **`Id`** Akang (contoh: `7163641352`).
+6. Cari tahu User ID Telegram Akang dengan membuka **`@userinfobot`** di Telegram, lalu catat angka **`Id`** Akang (contoh: `123456789`).
 
 ---
 
@@ -613,7 +613,7 @@ sudo usermod -aG docker $USER
 3. Isi konfigurasi di file `.env`:
    ```env
    TELEGRAM_BOT_TOKEN="TOKEN_DARI_BOTFATHER"
-   ALLOWED_USER_ID="7163641352"
+   ALLOWED_USER_ID="123456789"
    APPROVAL_MODE="ask_destructive"
    APPROVAL_TIMEOUT_SECONDS=120
    WORKSPACE_DIR="/workspace"

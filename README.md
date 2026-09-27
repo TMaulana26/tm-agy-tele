@@ -24,10 +24,14 @@ Bot ini dilengkapi fitur lengkap **paritas Hermes Agent**:
    - [Tahap 2: Persiapan di VPS & Login Antigravity CLI](#tahap-2-persiapan-di-vps--login-antigravity-cli-agy)
    - [Tahap 3: Clone Repository & Jalankan 1-Click Installer](#tahap-3-clone-repository--jalankan-1-click-installer)
    - [Tahap 4: Uji Coba Interaksi di Telegram](#tahap-4-uji-coba-interaksi-di-telegram)
-2. [Operasional & Pengendalian Bot di VPS (`manage.sh`)](#-operasional--pengendalian-bot-di-vps-managesh)
-3. [Daftar Perintah Resmi di Telegram](#-daftar-perintah-resmi-di-telegram)
-4. [Arsitektur Keamanan (Hermes Guard)](#-arsitektur-keamanan-hermes-guard)
-5. [Troubleshooting & Solusi Masalah Umum](#-troubleshooting--solusi-masalah-umum)
+2. [Sinkronisasi Otomatis Multi-VPS Fleet (Auto-Update)](#-sinkronisasi-otomatis-multi-vps-fleet-auto-update)
+   - [Mengapa Menggunakan Systemd Timer?](#mengapa-menggunakan-systemd-timer)
+   - [Cara Kerja Polling Senyap & Self-Healing](#cara-kerja-polling-senyap--self-healing)
+   - [Panduan Setup & Perintah Auto-Update](#panduan-setup--perintah-auto-update)
+3. [Operasional & Pengendalian Bot di VPS (`manage.sh`)](#-operasional--pengendalian-bot-di-vps-managesh)
+4. [Daftar Perintah Resmi di Telegram](#-daftar-perintah-resmi-di-telegram)
+5. [Arsitektur Keamanan (Hermes Guard)](#-arsitektur-keamanan-hermes-guard)
+6. [Troubleshooting & Solusi Masalah Umum](#-troubleshooting--solusi-masalah-umum)
 
 ---
 
@@ -46,7 +50,7 @@ Ikuti 4 tahap mudah berikut untuk memasang bot di VPS baru (Ubuntu / Debian / Ce
 2. **Dapatkan ID Akun Telegram Anda**:
    - Buka Telegram dan cari [@userinfobot](https://t.me/userinfobot).
    - Kirim `/start`.
-   - Catat angka pada baris `Id:` (contoh: `7163641352`). Simpan ini sebagai `ALLOWED_USER_ID`. *(Ini memastikan hanya akun Anda yang memiliki hak akses mengeksekusi bot)*.
+   - Catat angka pada baris `Id:` (contoh: `123456789`). Simpan ini sebagai `ALLOWED_USER_ID`. *(Ini memastikan hanya akun Anda yang memiliki hak akses mengeksekusi bot)*.
 
 3. **(Sangat Dianjurkan) Aktifkan Threaded Mode untuk Multi-Topik**:
    - Di chat dengan [@BotFather](https://t.me/BotFather), klik tombol biru **Open** (Mini App BotFather).
@@ -109,6 +113,7 @@ Ikuti 4 tahap mudah berikut untuk memasang bot di VPS baru (Ubuntu / Debian / Ce
    - Otomatis mendeteksi path `agy` dan direktori kerja Anda.
    - Menjalankan 95 unit test untuk memastikan integritas kode.
    - Mendaftarkan bot ke **Systemd Service (`tm-agy-tele.service`)** dan langsung menjalankannya di latar belakang (*background*).
+   - Menawarkan aktivasi **Auto-Update Multi-VPS Fleet** (`[Y/n]`) sehingga VPS otomatis tersinkronisasi saat Anda melakukan `git push`.
 
 > [!TIP]
 > Begitu `setup.sh` selesai, bot sudah **otomatis aktif dan berjalan di background**. Bot juga akan otomatis menyala kembali setiap kali VPS di-reboot.
@@ -127,6 +132,66 @@ Buka aplikasi Telegram di HP atau Laptop Anda, lalu cari bot yang baru Anda buat
    - Perhatikan reaksi native emoji `👀` yang muncul saat turn dimulai.
    - Perhatikan streaming respons teks secara langsung (*Bot API 9.5 Draft Streaming*).
    - Perhatikan reaksi emoji `👍` begitu tugas selesai dikerjakan!
+
+---
+
+## 🔄 Sinkronisasi Otomatis Multi-VPS Fleet (Auto-Update)
+
+Fitur **Multi-VPS Auto-Update Fleet** dirancang agar Anda dapat mengelola satu atau puluhan VPS sekaligus tanpa perlu login SSH manual setiap kali ada pembaruan kode di GitHub. Cukup lakukan `git push` dari laptop atau workspace Anda, seluruh instance bot di seluruh armada VPS akan otomatis mendeteksi perubahan, mengunduh kode terbaru, dan me-restart service dengan mulus.
+
+```text
+                  ┌─────────────────────────────────────┐
+                  │      GitHub Repository (main)       │
+                  └──────────────────┬──────────────────┘
+                                     │
+                 git push commit baru│ (Auto-detected in ~2m)
+                                     ▼
+        ┌────────────────────────────┼────────────────────────────┐
+        │                            │                            │
+        ▼                            ▼                            ▼
+ ┌──────────────┐             ┌──────────────┐             ┌──────────────┐
+ │ VPS Server A │             │ VPS Server B │             │ VPS Server C │
+ │ (Singapore)  │             │  (Jakarta)   │             │   (Tokyo)    │
+ ├──────────────┤             ├──────────────┤             ├──────────────┤
+ │Systemd Timer │             │Systemd Timer │             │Systemd Timer │
+ │Auto-Stash    │             │Auto-Stash    │             │Auto-Stash    │
+ │Git Pull      │             │Git Pull      │             │Git Pull      │
+ │Pip Sync      │             │Pip Sync      │             │Pip Sync      │
+ │Auto-Restart  │             │Auto-Restart  │             │Auto-Restart  │
+ └──────────────┘             └──────────────┘             └──────────────┘
+```
+
+### Mengapa Menggunakan Native Systemd Timer?
+- **Zero Inbound Port & Zero Webhook**: Tidak membutuhkan IP publik statis, domain, SSL cert, atau membuka port firewall VPS (`ufw`) untuk webhook GitHub.
+- **Hemat Daya & Efisien**: Berjalan sebagai unit *oneshot* systemd yang hanya aktif beberapa milidetik untuk polling per 2 menit, menggunakan memori ~0 MB saat menunggu.
+- **Anti-Stampede Randomized Delay**: Dilengkapi `RandomizedDelaySec=15` agar puluhan VPS tidak membebani rate limit GitHub secara bersamaan di detik yang persis sama.
+- **Self-Healing Merge Protection**: Skrip secara otomatis menjalankan `git stash` sebelum pull jika mendeteksi perbedaan izin/metadata lokal, sehingga update tidak akan pernah macet karena *merge conflict*.
+
+### Panduan Setup & Penggunaan
+
+#### 1. Setup Otomatis Saat Install Baru (`setup.sh`)
+Ketika Anda menginstal bot menggunakan `bash setup.sh`, wizard akan menanyakan di akhir:
+```text
+👉 Aktifkan Auto-Update otomatis di VPS ini? [Y/n]: Y
+```
+Cukup tekan `Enter` atau `Y`, dan timer akan langsung terpasang serta aktif.
+
+#### 2. Aktivasi & Manajemen Manual Kapan Saja (`manage.sh`)
+Jika Anda sudah memiliki VPS yang berjalan atau ingin mengelola fiturnya:
+
+```bash
+# Aktifkan Auto-Update (Polling tiap 2 menit di background)
+./manage.sh autoupdate enable
+
+# Periksa status timer & 10 riwayat auto-update terakhir
+./manage.sh autoupdate status
+
+# Pantau catatan log pembaruan otomatis
+tail -f autoupdate.log
+
+# Matikan sementara jika sedang ingin melakukan oprek/koding manual di VPS
+./manage.sh autoupdate disable
+```
 
 ---
 
