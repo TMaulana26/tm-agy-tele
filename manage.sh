@@ -33,7 +33,50 @@ fi
 
 ACTION="${1:-}"
 
+ensure_service_installed() {
+    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+    if [ ! -f "$service_file" ]; then
+        echo -e "${YELLOW}⚠️  Service ${SERVICE_NAME}.service belum terdaftar di systemd.${NC}"
+        echo -e "${BLUE}🚀 Mendaftarkan service ${SERVICE_NAME} ke systemd secara otomatis...${NC}"
+        local current_user
+        current_user=$(whoami)
+        local py_bin="${SCRIPT_DIR}/.venv/bin/python"
+        if [ ! -f "$py_bin" ]; then
+            py_bin=$(command -v python3 || echo "/usr/bin/python3")
+        fi
+
+        $SUDO bash -c "cat > ${service_file}" <<EOF
+[Unit]
+Description=Antigravity Telegram Bot (Hermes Parity Engine)
+After=network.target
+
+[Service]
+Type=simple
+User=${current_user}
+WorkingDirectory=${SCRIPT_DIR}
+EnvironmentFile=${SCRIPT_DIR}/.env
+ExecStart=${py_bin} ${SCRIPT_DIR}/bot.py
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        $SUDO systemctl daemon-reload
+        $SUDO systemctl enable "$SERVICE_NAME"
+        echo -e "${GREEN}✓ Service ${SERVICE_NAME} berhasil didaftarkan dan di-enable di systemd!${NC}"
+    fi
+}
+
 case "$ACTION" in
+    install)
+        ensure_service_installed
+        echo -e "${GREEN}▶️ Menjalankan service ${SERVICE_NAME}...${NC}"
+        $SUDO systemctl restart "$SERVICE_NAME"
+        sleep 1
+        $SUDO systemctl is-active --quiet "$SERVICE_NAME" && echo -e "${GREEN}✓ Service berhasil berjalan!${NC}" || echo -e "${RED}❌ Gagal memulai service.${NC}"
+        ;;
     status)
         echo -e "${CYAN}📊 Status Service ${SERVICE_NAME}:${NC}"
         $SUDO systemctl status "$SERVICE_NAME" --no-pager
@@ -43,6 +86,7 @@ case "$ACTION" in
         $SUDO journalctl -u "$SERVICE_NAME" -f -n 50
         ;;
     restart)
+        ensure_service_installed
         echo -e "${YELLOW}🔄 Me-restart service ${SERVICE_NAME}...${NC}"
         $SUDO systemctl restart "$SERVICE_NAME"
         sleep 1
@@ -54,6 +98,7 @@ case "$ACTION" in
         echo -e "${GREEN}✓ Service telah dihentikan.${NC}"
         ;;
     start)
+        ensure_service_installed
         echo -e "${GREEN}▶️ Menjalankan service ${SERVICE_NAME}...${NC}"
         $SUDO systemctl start "$SERVICE_NAME"
         sleep 1
@@ -76,6 +121,7 @@ case "$ACTION" in
             echo -e "${BLUE}📦 Memperbarui dependensi Python...${NC}"
             "$SCRIPT_DIR/.venv/bin/pip" install -r requirements.txt
         fi
+        ensure_service_installed
         echo -e "${YELLOW}🔄 Me-restart service ${SERVICE_NAME}...${NC}"
         $SUDO systemctl restart "$SERVICE_NAME"
         echo -e "${GREEN}🎉 Pembaruan selesai! Bot aktif dengan versi terbaru.${NC}"
@@ -89,6 +135,7 @@ case "$ACTION" in
         echo -e "${BOLD}Penggunaan:${NC} ./manage.sh [perintah]"
         echo ""
         echo -e "${BOLD}Daftar Perintah:${NC}"
+        echo -e "  ${GREEN}install${NC}  : Daftarkan unit service systemd & auto-start bot"
         echo -e "  ${GREEN}status${NC}   : Cek status service, PID, penggunaan RAM/CPU"
         echo -e "  ${GREEN}logs${NC}     : Tampilkan log real-time bot (journalctl stream)"
         echo -e "  ${GREEN}restart${NC}  : Restart bot seketika"
