@@ -122,6 +122,18 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"(?m)^#{1,6}\s*(.*?)$", format_header, text)
 
+    # 8b. Format list item temuan keparahan (misal: 1. [HIGH] ... atau 4. [MEDIUM] ...) agar bold konsisten
+    def format_severity_header(match):
+        content = match.group(1).strip()
+        clean_content = re.sub(r"\*\*(.*?)\*\*", r"\1", content)
+        return f"<b>{clean_content}</b>"
+
+    text = re.sub(
+        r"(?m)^(\d+\.\s+\[(?:CRITICAL|HIGH|MEDIUM|LOW|INFO)[^\]]*\][^\n]+)$",
+        format_severity_header,
+        text
+    )
+
     # 9. Format garis pembatas horizontal (---, ***, ___) menjadi garis tipis elegan Telegram
     text = re.sub(r"(?m)^[ \t]*([*\-_~]){3,}[ \t]*$", r"───────────────", text)
 
@@ -195,3 +207,21 @@ def append_duration_badge(formatted_html: str, elapsed_seconds: int) -> str:
     sec = max(1, elapsed_seconds)
     duration_str = f"~{sec}s" if sec < 60 else f"~{sec // 60}m {sec % 60}s"
     return f"{formatted_html.rstrip()}\n\n⏱️ <i>Respons dalam {duration_str}</i>"
+
+
+def strip_html_for_plain_text(html_text: str) -> str:
+    """
+    Strips Telegram HTML tags and unescapes entities for safe, clean plain-text fallback.
+    Prevents raw <b>, <code>, <pre>, &amp;, &#x27; from polluting user chat if Telegram rejects formatting.
+    """
+    if not html_text:
+        return ""
+    # Strip Telegram-supported HTML tags
+    clean = re.sub(
+        r"</?(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|tg-emoji|code|pre|blockquote|a)(?:\s+[^>]*)?>",
+        "",
+        html_text
+    )
+    # Unescape HTML entities (&amp; -> &, &lt; -> <, &gt; -> >, &#x27; -> ', etc.)
+    return html.unescape(clean)
+

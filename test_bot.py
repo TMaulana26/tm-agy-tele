@@ -5,6 +5,7 @@ subprocess execution, cancellation, message chunking, and command handlers.
 """
 
 import os
+import re
 import sys
 import json
 import asyncio
@@ -61,6 +62,66 @@ class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
         for chunk in chunks:
             self.assertLessEqual(len(chunk), 1000)
         self.assertEqual("".join(chunks), long_unbroken)
+
+    def test_split_message_html_tags_balanced(self):
+        huge_code = '<pre><code class="language-python">\n' + ('print("hello")\n' * 200) + '</code></pre>'
+        chunks = bot.split_message(huge_code, max_length=500)
+        self.assertGreater(len(chunks), 1)
+        tag_regex = re.compile(r'</?([a-zA-Z0-9_\-]+)(?:\s+[^>]*)?>')
+        for i, chunk in enumerate(chunks):
+            self.assertLessEqual(len(chunk), 500)
+            stack = []
+            for match in tag_regex.finditer(chunk):
+                tag_full = match.group(0)
+                tag_name = match.group(1).lower()
+                if not tag_full.startswith('</'):
+                    stack.append(tag_name)
+                else:
+                    self.assertTrue(len(stack) > 0, f"Unexpected closing tag </{tag_name}> in chunk {i}")
+                    self.assertEqual(stack.pop(), tag_name, f"Mismatched tag in chunk {i}")
+            self.assertEqual(len(stack), 0, f"Unclosed tags remaining in chunk {i}: {stack}")
+
+    def test_strip_html_for_plain_text(self):
+        html_input = '<b>🛡️ Laporan &amp; Analisis</b>\n<pre><code class="language-php">$x = &#x27;test&#x27;;</code></pre>'
+        plain = bot.strip_html_for_plain_text(html_input)
+        self.assertNotIn("<b>", plain)
+        self.assertNotIn("</b>", plain)
+        self.assertNotIn("<pre>", plain)
+        self.assertNotIn("&amp;", plain)
+        self.assertNotIn("&#x27;", plain)
+        self.assertIn("🛡️ Laporan & Analisis", plain)
+        self.assertIn("$x = 'test';", plain)
+
+    def test_format_severity_header(self):
+        text = "4. [MEDIUM] Bypass Batasan Tenant Admin di `/tenant/switch` (SEC-04)"
+        formatted = bot.markdown_to_telegram_html(text)
+        self.assertIn("<b>4. [MEDIUM] Bypass Batasan Tenant Admin di", formatted)
+        self.assertIn("<code>/tenant/switch</code>", formatted)
+
+    def test_split_message_security_audit_report(self):
+        # Sample representing the 12k report
+        sec_report = (
+            "<b>🛡️ Laporan Audit Keamanan</b>\n"
+            "<pre><code class=\"language-php\">\n" + ("$x = 1;\n" * 400) + "</code></pre>\n"
+            "───────────────\n"
+            "<b>4. [MEDIUM] Bypass Batasan Tenant</b>\n"
+            "<blockquote>Catatan penting keamanan</blockquote>\n"
+        )
+        chunks = bot.split_message(sec_report, max_length=1000)
+        self.assertGreater(len(chunks), 1)
+        tag_regex = re.compile(r'</?([a-zA-Z0-9_\-]+)(?:\s+[^>]*)?>')
+        for i, chunk in enumerate(chunks):
+            self.assertLessEqual(len(chunk), 1000)
+            stack = []
+            for match in tag_regex.finditer(chunk):
+                tag_full = match.group(0)
+                tag_name = match.group(1).lower()
+                if not tag_full.startswith('</'):
+                    stack.append(tag_name)
+                else:
+                    self.assertTrue(len(stack) > 0, f"Unexpected closing tag </{tag_name}> in chunk {i}")
+                    self.assertEqual(stack.pop(), tag_name, f"Mismatched tag in chunk {i}")
+            self.assertEqual(len(stack), 0, f"Unclosed tags remaining in chunk {i}: {stack}")
 
     # --------------------------------------------------------------------------
     # 2. HARDLINE SECURITY BLOCKLIST

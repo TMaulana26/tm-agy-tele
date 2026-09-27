@@ -92,7 +92,7 @@ from tele.streaming import (
     clear_status_bubble,
     split_message,
 )
-from tele.formatters import markdown_to_telegram_html, append_duration_badge
+from tele.formatters import markdown_to_telegram_html, append_duration_badge, strip_html_for_plain_text
 from tele.topics import (
     handle_topic_command,
     handle_topics_command,
@@ -216,6 +216,7 @@ async def safe_send_message(
         target_reply = effective_reply if "repl" not in err_str else None
         plain_kwargs = dict(send_kwargs)
         plain_kwargs["parse_mode"] = None
+        plain_kwargs["text"] = strip_html_for_plain_text(str(send_kwargs.get("text", "")))
         if target_reply is not None:
             plain_kwargs["reply_to_message_id"] = target_reply
         else:
@@ -261,7 +262,7 @@ async def safe_edit_message(
         logger.warning(f"Formatting parse error saat edit_message ({e}). Mengedit ulang sebagai plain text.")
         try:
             await msg.edit_text(
-                text=text,
+                text=strip_html_for_plain_text(text),
                 reply_markup=reply_markup,
                 parse_mode=None
             )
@@ -1349,6 +1350,28 @@ async def execute_agent_turn(
 
         # 4. Media Dispatch with strict Security Path Traversal Guard
         media_paths = extract_media_paths(output_text, workspace_dir=current_workspace)
+
+        # 4b. Auto document export for long reports or explicit markdown/document requests
+        user_wants_doc = bool(re.search(r"(?:kirim|buatkan|minta)\s+(?:file|berkas|dokumen|markdown|\.md|laporan)", str(user_text), re.IGNORECASE))
+        if (len(output_text) > 4000 or user_wants_doc) and not any(p.endswith(".md") for p in media_paths):
+            try:
+                doc_dir = get_upload_dir()
+                doc_dir.mkdir(parents=True, exist_ok=True)
+                doc_slug = "laporan"
+                if re.search(r"keamanan|security|audit|vulnerabilit", output_text[:400], re.IGNORECASE):
+                    doc_slug = "laporan_audit_keamanan"
+                elif re.search(r"ringkasan|summary", output_text[:400], re.IGNORECASE):
+                    doc_slug = "ringkasan"
+
+                doc_filename = f"{doc_slug}_{int(time.time())}.md"
+                doc_path = doc_dir / doc_filename
+                doc_path.write_text(output_text, encoding="utf-8")
+
+                is_valid, _ = validate_media_delivery_path(str(doc_path), current_workspace)
+                if is_valid:
+                    media_paths.append(str(doc_path))
+            except Exception as e_doc:
+                logger.warning(f"Failed to auto-export markdown document: {e_doc}")
 
         # 5. Format HTML with badge
         formatted_html = markdown_to_telegram_html(output_text)
