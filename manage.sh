@@ -116,7 +116,12 @@ case "$ACTION" in
         ;;
     update)
         echo -e "${BLUE}📥 Mengambil pembaruan kode terbaru dari Git...${NC}"
+        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            echo -e "${YELLOW}📦 Mengamankan perubahan lokal sementara (git stash)...${NC}"
+            git stash --quiet 2>/dev/null || true
+        fi
         git pull origin main || git pull
+        chmod +x "$SCRIPT_DIR/manage.sh" "$SCRIPT_DIR/setup.sh" 2>/dev/null || true
         if [ -f "$SCRIPT_DIR/.venv/bin/pip" ]; then
             echo -e "${BLUE}📦 Memperbarui dependensi Python...${NC}"
             "$SCRIPT_DIR/.venv/bin/pip" install -r requirements.txt
