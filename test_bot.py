@@ -709,6 +709,100 @@ docker ps -a
                     self.assertEqual(conv_id, "conv-timeout-2")
                     mock_proc.terminate.assert_called_once()
 
+    def test_recover_last_response_artifact_fallback(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            conv_id = "test-conv-artifact-bot"
+            conv_dir = tmppath / ".gemini" / "brain" / conv_id
+            log_dir = conv_dir / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            transcript_file = log_dir / "transcript.jsonl"
+
+            lines = [
+                json.dumps({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": "buat audit"}),
+                json.dumps({"step_index": 1, "source": "MODEL", "type": "GENERIC", "status": "RUNNING", "content": "Running tool"})
+            ]
+            transcript_file.write_text("\n".join(lines), encoding="utf-8")
+
+            # Create artifact
+            art_file = conv_dir / "audit.md"
+            art_file.write_text("# Laporan Audit Bot", encoding="utf-8")
+
+            with patch("bot.WORKSPACE_DIR", tmpdir):
+                recovered, res_id = bot.recover_last_response_from_transcript(conv_id)
+                self.assertIsNotNone(recovered)
+                self.assertIn("Laporan Audit Bot", recovered)
+                self.assertEqual(res_id, conv_id)
+
+    async def test_run_agy_cli_success_empty_response_recovered(self):
+        mock_proc = AsyncMock()
+        mock_proc.pid = 7777
+        json_output = json.dumps({
+            "conversation_id": "conv-empty-bot-1",
+            "status": "SUCCESS",
+            "response": "",
+            "duration_seconds": 15.0,
+            "num_turns": 2
+        }).encode("utf-8")
+        mock_proc.communicate.return_value = (json_output, b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with patch("os.path.exists", return_value=True):
+                with patch("bot.recover_last_response_from_transcript", return_value=("# Laporan Selesai", "conv-empty-bot-1")):
+                    resp, conv_id = await bot.run_agy_cli(
+                        user_id=111111,
+                        prompt="tulis laporan",
+                        conv_id="conv-empty-bot-1",
+                        cwd="."
+                    )
+                    self.assertEqual(resp, "# Laporan Selesai")
+                    self.assertEqual(conv_id, "conv-empty-bot-1")
+
+    async def test_run_agy_cli_success_empty_response_fallback_message(self):
+        mock_proc = AsyncMock()
+        mock_proc.pid = 7777
+        json_output = json.dumps({
+            "conversation_id": "conv-empty-bot-2",
+            "status": "SUCCESS",
+            "response": "",
+            "duration_seconds": 377.1,
+            "num_turns": 2
+        }).encode("utf-8")
+        mock_proc.communicate.return_value = (json_output, b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with patch("os.path.exists", return_value=True):
+                with patch("bot.recover_last_response_from_transcript", return_value=(None, "conv-empty-bot-2")):
+                    resp, conv_id = await bot.run_agy_cli(
+                        user_id=111111,
+                        prompt="tugas tanpa teks",
+                        conv_id="conv-empty-bot-2",
+                        cwd="."
+                    )
+                    self.assertIn("Tugas Selesai!", resp)
+                    self.assertIn("377.1s", resp)
+                    self.assertIn("2 turns", resp)
+                    self.assertNotIn('{"conversation_id"', resp)
+                    self.assertEqual(conv_id, "conv-empty-bot-2")
+
+    async def test_run_agy_cli_raw_json_leak_prevention(self):
+        mock_proc = AsyncMock()
+        mock_proc.pid = 7777
+        raw_json_str = '{"conversation_id": "conv-raw-leak", "status": "SUCCESS"}'
+        mock_proc.communicate.return_value = (raw_json_str.encode("utf-8"), b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            with patch("os.path.exists", return_value=True):
+                resp, conv_id = await bot.run_agy_cli(
+                    user_id=111111,
+                    prompt="test raw stdout leak",
+                    conv_id="conv-raw-leak",
+                    cwd="."
+                )
+                self.assertIn("Tugas Selesai!", resp)
+                self.assertNotIn('{"conversation_id"', resp)
+
     # --------------------------------------------------------------------------
     # 12. TELEGRAM UX ENHANCEMENTS (HERMES-INSPIRED)
     # --------------------------------------------------------------------------

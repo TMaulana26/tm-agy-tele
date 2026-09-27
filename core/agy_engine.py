@@ -126,9 +126,40 @@ def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optio
                     last_planner_content = content
 
         if user_input_seen_after_planner:
-            return None, resolved_conv_id
+            # Cegah mengambil PLANNER_RESPONSE lama dari giliran sebelumnya
+            last_planner_content = None
 
-        return last_planner_content, resolved_conv_id
+        # Check if an artifact (.md) was generated in conv_dir if last_planner_content is empty
+        if not last_planner_content:
+            candidate_dirs = [
+                transcript_path.parent.parent.parent,
+                transcript_path.parent.parent,
+            ]
+            for c_dir in candidate_dirs:
+                if c_dir and c_dir.is_dir():
+                    artifacts = [
+                        f for f in c_dir.glob("*.md")
+                        if f.is_file() and not f.name.startswith(".")
+                    ]
+                    if artifacts:
+                        artifacts.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                        try:
+                            art_text = artifacts[0].read_text(encoding="utf-8", errors="replace").strip()
+                            if art_text:
+                                logger.info(f"Berhasil me-recover artefak '{artifacts[0].name}' dari {c_dir}")
+                                last_planner_content = art_text
+                                break
+                        except Exception as e_art:
+                            logger.debug(f"Gagal membaca artefak {artifacts[0]}: {e_art}")
+
+        if last_planner_content:
+            logger.info(
+                f"Berhasil me-recover balasan model ({len(last_planner_content)} karakter) dari "
+                f"{transcript_path} (Conv: {resolved_conv_id})"
+            )
+            return last_planner_content, resolved_conv_id
+
+        return None, resolved_conv_id
     except Exception as e:
         logger.warning(f"Error reading transcript {transcript_path}: {e}")
         return None, resolved_conv_id
@@ -258,15 +289,42 @@ async def run_agy_cli(
         resp = parsed_json.get("response", "").strip()
         status = parsed_json.get("status", "")
         err = parsed_json.get("error", "").strip()
+        duration = parsed_json.get("duration_seconds")
+        num_turns = parsed_json.get("num_turns")
 
         if status == "ERROR" and err:
             return f"❌ **Error dari agy:**\n```text\n{err}\n```", ret_conv
+
+        if not resp:
+            # Fallback: Recover from transcript or artifacts if response was empty
+            recover_fn = getattr(sys.modules[__name__], "recover_last_response_from_transcript", recover_last_response_from_transcript)
+            recovered, found_id = recover_fn(ret_conv)
+            if recovered and recovered.strip():
+                resp = recovered.strip()
+                if found_id:
+                    ret_conv = found_id
+
         if resp:
             return resp, ret_conv
         elif err:
             return f"⚠️ **Output agy:**\n```text\n{err}\n```", ret_conv
+        else:
+            dur_str = f" ({duration:.1f}s)" if isinstance(duration, (int, float)) else ""
+            turns_str = f" ({num_turns} turns)" if isinstance(num_turns, int) and num_turns > 1 else ""
+            return (
+                f"✅ **Tugas Selesai!** Antigravity telah menyelesaikan seluruh langkah eksekusi di latar belakang{dur_str}{turns_str}, namun tidak ada pesan balasan teks langsung.",
+                ret_conv
+            )
 
     if stdout_text:
+        clean_stdout = stdout_text.strip()
+        if clean_stdout.startswith("{") and clean_stdout.endswith("}"):
+            try:
+                data = json.loads(clean_stdout)
+                if "conversation_id" in data or "status" in data:
+                    return "✅ **Tugas Selesai!** Antigravity telah menyelesaikan tugas sistem tanpa balasan teks.", conv_id
+            except Exception:
+                pass
         return stdout_text, conv_id
     elif stderr_text:
         return f"⚠️ Output (stderr):\n```text\n{stderr_text}\n```", conv_id
