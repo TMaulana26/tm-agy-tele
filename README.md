@@ -147,13 +147,19 @@ Untuk mengelola bot sehari-hari di VPS, gunakan skrip praktis `./manage.sh`:
 # 4. Hentikan bot sementara
 ./manage.sh stop
 
-# 5. Nyalakan bot kembali
-./manage.sh start
-
-# 6. Perbarui kode ke versi terbaru dari Git + update pip + restart otomatis
+# 6. Perbarui kode ke versi terbaru secara manual + update pip + restart otomatis
 ./manage.sh update
 
-# 7. Jalankan seluruh unit test mandiri
+# 7. Aktifkan Auto-Update Fleet (Otomatis sync tiap 2 menit saat Anda git push ke GitHub!)
+./manage.sh autoupdate enable
+
+# 8. Cek status auto-update timer & 10 riwayat update terakhir
+./manage.sh autoupdate status
+
+# 9. Matikan auto-update otomatis jika sedang ingin oprek manual
+./manage.sh autoupdate disable
+
+# 10. Jalankan seluruh unit test mandiri
 ./manage.sh test
 ```
 

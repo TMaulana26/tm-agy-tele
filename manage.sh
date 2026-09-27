@@ -126,6 +126,82 @@ case "$ACTION" in
         $SUDO systemctl restart "$SERVICE_NAME"
         echo -e "${GREEN}🎉 Pembaruan selesai! Bot aktif dengan versi terbaru.${NC}"
         ;;
+    check-update)
+        # Quietly fetch latest references from git
+        if ! git fetch origin main --quiet 2>/dev/null; then
+            git fetch --quiet 2>/dev/null || exit 0
+        fi
+        LOCAL_REV=$(git rev-parse HEAD 2>/dev/null || echo "")
+        REMOTE_REV=$(git rev-parse origin/main 2>/dev/null || git rev-parse FETCH_HEAD 2>/dev/null || echo "")
+
+        if [ -n "$LOCAL_REV" ] && [ -n "$REMOTE_REV" ] && [ "$LOCAL_REV" != "$REMOTE_REV" ]; then
+            echo -e "${YELLOW}⚡ Pembaruan terdeteksi di GitHub! (${LOCAL_REV:0:7} -> ${REMOTE_REV:0:7})${NC}"
+            LOG_FILE="$SCRIPT_DIR/autoupdate.log"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Auto-updating: ${LOCAL_REV:0:7} -> ${REMOTE_REV:0:7}" >> "$LOG_FILE"
+            # Jalankan update penuh
+            "$SCRIPT_DIR/manage.sh" update >> "$LOG_FILE" 2>&1
+        fi
+        ;;
+    autoupdate|enable-autoupdate|disable-autoupdate)
+        SUB_ACTION="${2:-}"
+        [ "$ACTION" = "enable-autoupdate" ] && SUB_ACTION="enable"
+        [ "$ACTION" = "disable-autoupdate" ] && SUB_ACTION="disable"
+        SUB_ACTION="${SUB_ACTION:-status}"
+
+        TIMER_SERVICE_NAME="tm-agy-autoupdate"
+        TIMER_SERVICE_FILE="/etc/systemd/system/${TIMER_SERVICE_NAME}.service"
+        TIMER_UNIT_FILE="/etc/systemd/system/${TIMER_SERVICE_NAME}.timer"
+        CURRENT_USER=$(whoami)
+
+        case "$SUB_ACTION" in
+            enable|on)
+                echo -e "${BLUE}🚀 Mengonfigurasi Auto-Update Timer (Sync tiap 2 menit)...${NC}"
+                $SUDO bash -c "cat > ${TIMER_SERVICE_FILE}" <<EOF
+[Unit]
+Description=Antigravity Telegram Bot Auto-Update Checker
+After=network.target
+
+[Service]
+Type=oneshot
+User=${CURRENT_USER}
+WorkingDirectory=${SCRIPT_DIR}
+ExecStart=${SCRIPT_DIR}/manage.sh check-update
+EOF
+
+                $SUDO bash -c "cat > ${TIMER_UNIT_FILE}" <<EOF
+[Unit]
+Description=Antigravity Telegram Bot Auto-Update Timer (Check every 2 min)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+                $SUDO systemctl daemon-reload
+                $SUDO systemctl enable --now "${TIMER_SERVICE_NAME}.timer"
+                echo -e "${GREEN}✓ Auto-Update Timer aktif! VPS akan otomatis sync tiap 2 menit saat ada git push.${NC}"
+                ;;
+            disable|off)
+                echo -e "${YELLOW}🛑 Menonaktifkan Auto-Update Timer...${NC}"
+                $SUDO systemctl disable --now "${TIMER_SERVICE_NAME}.timer" 2>/dev/null || true
+                echo -e "${GREEN}✓ Auto-Update Timer telah dinonaktifkan.${NC}"
+                ;;
+            status|*)
+                echo -e "${CYAN}📊 Status Auto-Update Timer:${NC}"
+                $SUDO systemctl status "${TIMER_SERVICE_NAME}.timer" --no-pager 2>/dev/null || echo "Timer belum terpasang. Jalankan: ./manage.sh autoupdate enable"
+                if [ -f "$SCRIPT_DIR/autoupdate.log" ]; then
+                    echo ""
+                    echo -e "${CYAN}📜 10 Riwayat Auto-Update Terakhir:${NC}"
+                    tail -n 10 "$SCRIPT_DIR/autoupdate.log"
+                fi
+                ;;
+        esac
+        ;;
     *)
         echo ""
         echo -e "${CYAN}================================================================${NC}"
@@ -135,17 +211,22 @@ case "$ACTION" in
         echo -e "${BOLD}Penggunaan:${NC} ./manage.sh [perintah]"
         echo ""
         echo -e "${BOLD}Daftar Perintah:${NC}"
-        echo -e "  ${GREEN}install${NC}  : Daftarkan unit service systemd & auto-start bot"
-        echo -e "  ${GREEN}status${NC}   : Cek status service, PID, penggunaan RAM/CPU"
-        echo -e "  ${GREEN}logs${NC}     : Tampilkan log real-time bot (journalctl stream)"
-        echo -e "  ${GREEN}restart${NC}  : Restart bot seketika"
-        echo -e "  ${GREEN}start${NC}    : Jalankan bot service"
-        echo -e "  ${GREEN}stop${NC}     : Hentikan bot service"
-        echo -e "  ${GREEN}test${NC}     : Jalankan pengujian unit otomatis"
-        echo -e "  ${GREEN}update${NC}   : Git pull terbaru + pip update + auto-restart"
+        echo -e "  ${GREEN}install${NC}             : Daftarkan unit service systemd & auto-start bot"
+        echo -e "  ${GREEN}status${NC}              : Cek status service, PID, penggunaan RAM/CPU"
+        echo -e "  ${GREEN}logs${NC}                : Tampilkan log real-time bot (journalctl stream)"
+        echo -e "  ${GREEN}restart${NC}             : Restart bot seketika"
+        echo -e "  ${GREEN}start${NC}               : Jalankan bot service"
+        echo -e "  ${GREEN}stop${NC}                : Hentikan bot service"
+        echo -e "  ${GREEN}test${NC}                : Jalankan pengujian unit otomatis"
+        echo -e "  ${GREEN}update${NC}              : Git pull terbaru + pip update + auto-restart"
+        echo -e "  ${GREEN}check-update${NC}        : Cek apakah ada commit baru di GitHub"
+        echo -e "  ${GREEN}autoupdate enable${NC}   : Aktifkan auto-update otomatis (sync tiap 2 menit)"
+        echo -e "  ${GREEN}autoupdate disable${NC}  : Matikan auto-update otomatis"
+        echo -e "  ${GREEN}autoupdate status${NC}   : Cek status auto-update timer & log riwayat"
         echo ""
         echo -e "${BOLD}Contoh:${NC}"
         echo "  ./manage.sh logs"
+        echo "  ./manage.sh autoupdate enable"
         echo "  ./manage.sh restart"
         echo ""
         ;;

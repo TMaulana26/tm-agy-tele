@@ -259,7 +259,22 @@ if $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
     echo -e "  • Pantau log realtime : ${CYAN}./manage.sh logs${NC}"
     echo -e "  • Restart bot         : ${CYAN}./manage.sh restart${NC}"
     echo -e "  • Stop bot            : ${CYAN}./manage.sh stop${NC}"
-    echo -e "  • Update kode terbaru : ${CYAN}./manage.sh update${NC}"
+    echo -e "  • Update kode manual  : ${CYAN}./manage.sh update${NC}"
+    echo -e "  • Auto-Update Fleet   : ${CYAN}./manage.sh autoupdate [enable|disable|status]${NC}"
+    echo ""
+    echo -e "${MAGENTA}----------------------------------------------------------------${NC}"
+    echo -e "${BOLD}🚀 Fitur Auto-Update Multi-VPS Fleet:${NC}"
+    echo -e "   VPS ini dapat otomatis memperbarui kode setiap 2 menit jika mendeteksi"
+    echo -e "   ada commit/push baru di GitHub tanpa perlu SSH manual lagi."
+    echo -e "${MAGENTA}----------------------------------------------------------------${NC}"
+    echo -ne "${CYAN}👉 Aktifkan Auto-Update otomatis di VPS ini? [Y/n]: ${NC}"
+    read -r ENABLE_AUTOUPDATE
+    ENABLE_AUTOUPDATE=${ENABLE_AUTOUPDATE:-Y}
+    if [[ "$ENABLE_AUTOUPDATE" =~ ^[Yy]$ ]]; then
+        "$SCRIPT_DIR/manage.sh" autoupdate enable || true
+    else
+        echo -e "${YELLOW}   Auto-update dilewati. Anda bisa mengaktifkannya kapan saja via: ./manage.sh autoupdate enable${NC}"
+    fi
     echo ""
     echo -e "Buka aplikasi Telegram dan ketik ${YELLOW}/start${NC} atau ${YELLOW}/help${NC} di bot Anda untuk mulai! 🚀"
     echo ""
