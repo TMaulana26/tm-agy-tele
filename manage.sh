@@ -33,7 +33,28 @@ fi
 
 ACTION="${1:-}"
 
+cleanup_legacy_services() {
+    for legacy_svc in antigravity-bot antigravity-tele-bot; do
+        if [ "$legacy_svc" = "$SERVICE_NAME" ]; then
+            continue
+        fi
+        if systemctl is-active --quiet "$legacy_svc" 2>/dev/null; then
+            echo -e "${YELLOW}⚠️  Terdeteksi legacy service '$legacy_svc' aktif. Menghentikan demi mencegah 409 Conflict...${NC}"
+            $SUDO systemctl stop "$legacy_svc" 2>/dev/null || true
+            $SUDO systemctl disable "$legacy_svc" 2>/dev/null || true
+        elif systemctl is-enabled --quiet "$legacy_svc" 2>/dev/null; then
+            $SUDO systemctl disable "$legacy_svc" 2>/dev/null || true
+        fi
+        if [ -f "/etc/systemd/system/${legacy_svc}.service" ]; then
+            echo -e "${BLUE}🧹 Membersihkan file legacy service /etc/systemd/system/${legacy_svc}.service...${NC}"
+            $SUDO rm -f "/etc/systemd/system/${legacy_svc}.service" 2>/dev/null || true
+            $SUDO systemctl daemon-reload 2>/dev/null || true
+        fi
+    done
+}
+
 ensure_service_installed() {
+    cleanup_legacy_services
     local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
     if [ ! -f "$service_file" ]; then
         echo -e "${YELLOW}⚠️  Service ${SERVICE_NAME}.service belum terdaftar di systemd.${NC}"

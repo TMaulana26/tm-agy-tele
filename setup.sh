@@ -216,6 +216,22 @@ SERVICE_NAME="tm-agy-tele"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 CURRENT_USER=$(whoami)
 
+# Bersihkan legacy service jika masih aktif demi mencegah 409 Conflict getUpdates
+for legacy_svc in antigravity-bot antigravity-tele-bot; do
+    if [ "$legacy_svc" != "$SERVICE_NAME" ]; then
+        if systemctl is-active --quiet "$legacy_svc" 2>/dev/null; then
+            echo -e "${YELLOW}⚠️  Menghentikan legacy service '$legacy_svc' aktif demi mencegah 409 Conflict...${NC}"
+            $SUDO systemctl stop "$legacy_svc" 2>/dev/null || true
+            $SUDO systemctl disable "$legacy_svc" 2>/dev/null || true
+        elif systemctl is-enabled --quiet "$legacy_svc" 2>/dev/null; then
+            $SUDO systemctl disable "$legacy_svc" 2>/dev/null || true
+        fi
+        if [ -f "/etc/systemd/system/${legacy_svc}.service" ]; then
+            $SUDO rm -f "/etc/systemd/system/${legacy_svc}.service" 2>/dev/null || true
+        fi
+    fi
+done
+
 # Generate systemd unit file
 $SUDO bash -c "cat > ${SERVICE_PATH}" <<EOF
 [Unit]

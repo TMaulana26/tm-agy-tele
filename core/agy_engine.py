@@ -63,43 +63,60 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
     # Dynamic recursive scan under ~/.gemini for any brain folders
     search_parents = [home / ".gemini", Path("/home/ubuntu/.gemini"), Path(WORKSPACE_DIR) / ".gemini"]
     for sp in search_parents:
-        if sp.is_dir():
-            try:
+        try:
+            if sp.is_dir():
                 for b_dir in sp.glob("**/brain"):
-                    if b_dir.is_dir() and b_dir not in candidate_bases:
-                        candidate_bases.append(b_dir)
-            except Exception:
-                pass
+                    try:
+                        if b_dir.is_dir() and b_dir not in candidate_bases:
+                            candidate_bases.append(b_dir)
+                    except (PermissionError, OSError):
+                        pass
+        except (PermissionError, OSError):
+            pass
 
-    valid_bases = [b for b in candidate_bases if b.is_dir()]
+    valid_bases: List[Path] = []
+    for b in candidate_bases:
+        try:
+            if b.is_dir():
+                valid_bases.append(b)
+        except (PermissionError, OSError):
+            continue
 
     if conv_id:
         for base in valid_bases:
-            cand = base / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
-            if cand.is_file():
-                return cand, conv_id
+            try:
+                cand = base / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+                if cand.is_file():
+                    return cand, conv_id
+            except (PermissionError, OSError):
+                continue
         return None, conv_id
 
     # Fallback to newest conversation folder: prioritize current workspace first
     ws_brain = Path(WORKSPACE_DIR) / ".gemini" / "brain"
-    if ws_brain.is_dir():
-        ws_newest_file = None
-        ws_newest_mtime = -1.0
-        ws_conv_id = None
-        try:
+    try:
+        if ws_brain.is_dir():
+            ws_newest_file = None
+            ws_newest_mtime = -1.0
+            ws_conv_id = None
             for item in ws_brain.iterdir():
-                if item.is_dir():
-                    cand = item / ".system_generated" / "logs" / "transcript.jsonl"
-                    if cand.is_file():
-                        mtime = cand.stat().st_mtime
-                        if mtime > ws_newest_mtime:
-                            ws_newest_mtime = mtime
-                            ws_newest_file = cand
-                            ws_conv_id = item.name
+                try:
+                    if item.is_dir():
+                        cand = item / ".system_generated" / "logs" / "transcript.jsonl"
+                        if cand.is_file():
+                            mtime = cand.stat().st_mtime
+                            if mtime > ws_newest_mtime:
+                                ws_newest_mtime = mtime
+                                ws_newest_file = cand
+                                ws_conv_id = item.name
+                except (PermissionError, OSError):
+                    continue
             if ws_newest_file and ws_conv_id:
                 return ws_newest_file, ws_conv_id
-        except Exception as e:
-            logger.debug(f"Error checking workspace brain dir {ws_brain}: {e}")
+    except (PermissionError, OSError):
+        pass
+    except Exception as e:
+        logger.debug(f"Error checking workspace brain dir {ws_brain}: {e}")
 
     # Fallback to newest conversation folder across all candidate bases
     newest_file: Optional[Path] = None

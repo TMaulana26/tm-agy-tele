@@ -23,3 +23,7 @@ This repository and VPS environment runs headless Antigravity CLI sessions conne
      `MEDIA:/absolute/or/relative/path/to/file`
    - The Telegram bot daemon automatically intercepts this directive and delivers the native document attachment to the Telegram chat thread.
 
+5. **Network Command Timeouts & Anti-Hang Probes**:
+   - When executing terminal commands that test network connections, WebSocket handshakes, socket listeners, or streaming endpoints (e.g. `curl`, `wget`, `nc`, or WebSocket probe scripts), ALWAYS supply strict explicit timeouts (e.g. `curl --max-time 10 ...`, `wget -T 10 ...`).
+   - Do NOT run indefinite streaming commands or WebSocket listeners without exit timeouts, as they will cause the engine subprocess to hang and eventually trigger an execution timeout.
+

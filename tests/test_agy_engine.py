@@ -113,5 +113,19 @@ class TestAgyEngine(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('{"conversation_id"', resp)
 
 
+    def test_get_transcript_path_permission_error_resilience(self):
+        # Verify get_transcript_path does not raise PermissionError when encountering restricted directories
+        with patch("pathlib.Path.is_dir") as mock_is_dir:
+            # Raise PermissionError on some is_dir calls (simulating /root or restricted access)
+            def is_dir_side_effect(self_obj=None):
+                raise PermissionError(13, "Permission denied")
+
+            mock_is_dir.side_effect = is_dir_side_effect
+            # Should safely return (None, conv_id) without crashing
+            res_file, res_id = agy_engine.get_transcript_path("test-restricted-conv")
+            self.assertIsNone(res_file)
+            self.assertEqual(res_id, "test-restricted-conv")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -110,7 +110,10 @@ SYSTEM_INSTRUCTIONS: str = (
     "4. PENGIRIMAN FILE KE TELEGRAM: Jika pengguna meminta file/dokumen (misal: 'kirim file X', 'kirim laporan', 'kirim berkas') "
     "atau Anda membuat/mengubah berkas yang ingin diserahkan langsung ke pengguna, sertakan baris tersendiri di dalam respons Anda:\n"
     "MEDIA:/path/ke/file\n"
-    "Sistem bot akan secara otomatis mendeteksi directive tersebut dan mengirimkan berkas asli ke chat Telegram pengguna."
+    "Sistem bot akan secara otomatis mendeteksi directive tersebut dan mengirimkan berkas asli ke chat Telegram pengguna.\n"
+    "5. BATAS WAKTU PERINTAH JARINGAN (ANTI-HANG): Saat menjalankan perintah terminal pengujian jaringan atau probe socket/streaming "
+    "(seperti curl, wget, nc, websocket probe), SELALU gunakan batas waktu ketat (misal: curl --max-time 10 ...) "
+    "agar proses tidak menggantung tanpa batas waktu."
 )
 
 def build_cli_prompt(prompt: str) -> str:
