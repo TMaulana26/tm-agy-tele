@@ -1351,6 +1351,27 @@ async def execute_agent_turn(
         # 4. Media Dispatch with strict Security Path Traversal Guard
         media_paths = extract_media_paths(output_text, workspace_dir=current_workspace)
 
+        # 4a. Smart User Intent File Auto-Discovery:
+        # Detect explicit file send requests (e.g. "kirim file X", "kirim berkas X", "unduh X")
+        # and attach the file from workspace if it exists and passes security validation
+        file_intent_patterns = [
+            r"(?:kirim|unduh|download|minta|lihat)\s+(?:file|berkas|dokumen)?\s*[`'\"]?([a-zA-Z0-9_\-\.\/]+?\.[a-zA-Z0-9]+)[`'\"]?",
+            r"(?:kirimkan|lihatkan)\s+(?:file|berkas|dokumen)\s*[`'\"]?([a-zA-Z0-9_\-\.\/]+?\.[a-zA-Z0-9]+)[`'\"]?",
+        ]
+        for f_pat in file_intent_patterns:
+            for match in re.finditer(f_pat, str(user_text), re.IGNORECASE):
+                req_filename = match.group(1).strip().strip("`'\"")
+                candidate_paths = [
+                    (Path(current_workspace) / req_filename).resolve(),
+                    (get_upload_dir() / req_filename).resolve(),
+                ]
+                for cand in candidate_paths:
+                    if cand.is_file():
+                        is_valid, _ = validate_media_delivery_path(str(cand), current_workspace)
+                        if is_valid and str(cand) not in media_paths:
+                            media_paths.append(str(cand))
+                            break
+
         # 4b. Auto document export for long reports or explicit markdown/document requests
         user_wants_doc = bool(re.search(r"(?:kirim|buatkan|minta)\s+(?:file|berkas|dokumen|markdown|\.md|laporan)", str(user_text), re.IGNORECASE))
         if (len(output_text) > 4000 or user_wants_doc) and not any(p.endswith(".md") for p in media_paths):

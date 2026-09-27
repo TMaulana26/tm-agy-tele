@@ -16,3 +16,10 @@ This repository and VPS environment runs headless Antigravity CLI sessions conne
 3. **Production Safety & Non-Interactive Execution**:
    - The bot runs non-interactively without a desktop UI. All outputs must be final and concise.
    - Do not request interactive browser sessions or UI-dependent tools.
+
+4. **Native File & Media Delivery Protocol (`MEDIA:/path/to/file`)**:
+   - Whenever the user asks to send, export, or download a file, report, document, image, or script (e.g. "kirim file X", "send report.md", "unduh berkas"), or when you generate a file deliverable that the user requested:
+   - Include a standalone line in your final response formatted as:
+     `MEDIA:/absolute/or/relative/path/to/file`
+   - The Telegram bot daemon automatically intercepts this directive and delivers the native document attachment to the Telegram chat thread.
+

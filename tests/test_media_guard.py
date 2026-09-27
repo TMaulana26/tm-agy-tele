@@ -96,6 +96,20 @@ class TestMediaGuard(unittest.TestCase):
         self.assertIn(str(self.safe_file.resolve()), extracted)
         self.assertIn(str(self.voice_file.resolve()), extracted)
 
+    def test_extract_media_paths_with_backticks_and_prefixes(self):
+        # AI often formats paths with backticks, brackets, or file://
+        text = (
+            f"Berikut berkas yang diminta:\n"
+            f"MEDIA: `{self.safe_file.name}`\n"
+            f"[BERKAS: `{self.voice_file.name}`]\n"
+            f"FILE: <{self.safe_file.name}>\n"
+        )
+        extracted = extract_media_paths(text, workspace_dir=str(self.ws))
+        self.assertGreaterEqual(len(extracted), 2)
+        self.assertIn(str(self.safe_file.resolve()), extracted)
+        self.assertIn(str(self.voice_file.resolve()), extracted)
+
 
 if __name__ == "__main__":
     unittest.main()
+

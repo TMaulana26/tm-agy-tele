@@ -123,6 +123,34 @@ class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(stack.pop(), tag_name, f"Mismatched tag in chunk {i}")
             self.assertEqual(len(stack), 0, f"Unclosed tags remaining in chunk {i}: {stack}")
 
+    async def test_send_outbound_media_reply_retry(self):
+        from tele.media import send_outbound_media
+        from telegram.error import BadRequest
+        mock_bot = MagicMock()
+        mock_bot.send_document = AsyncMock(
+            side_effect=[
+                BadRequest("Message to be replied not found"),
+                MagicMock(message_id=999)
+            ]
+        )
+        safe_file = bot.get_upload_dir() / "test_doc.md"
+        safe_file.write_text("# Title", encoding="utf-8")
+        try:
+            res = await send_outbound_media(
+                bot=mock_bot,
+                chat_id=12345,
+                file_path=str(safe_file),
+                reply_to_message_id=555,
+                message_thread_id=10
+            )
+            self.assertIsNotNone(res)
+            self.assertEqual(mock_bot.send_document.call_count, 2)
+            second_call_kwargs = mock_bot.send_document.call_args_list[1].kwargs
+            self.assertNotIn("reply_to_message_id", second_call_kwargs)
+            self.assertEqual(second_call_kwargs.get("message_thread_id"), 10)
+        finally:
+            safe_file.unlink(missing_ok=True)
+
     # --------------------------------------------------------------------------
     # 2. HARDLINE SECURITY BLOCKLIST
     # --------------------------------------------------------------------------

@@ -106,7 +106,11 @@ SYSTEM_INSTRUCTIONS: str = (
     "1. Anda berjalan dalam sesi headless non-interaktif (print mode).\n"
     "2. JANGAN PERNAH menggunakan tool internal `schedule` untuk recurring cron atau background timers. "
     "Jika pengguna meminta cron job atau penjadwalan otomatis, buat script yang relevan dan tanyakan/konfirmasi kepada pengguna sebelum memasang ke crontab host.\n"
-    "3. Selalu selesaikan eksekusi perintah terminal sebelum mengakhiri giliran Anda."
+    "3. Selalu selesaikan eksekusi perintah terminal sebelum mengakhiri giliran Anda.\n"
+    "4. PENGIRIMAN FILE KE TELEGRAM: Jika pengguna meminta file/dokumen (misal: 'kirim file X', 'kirim laporan', 'kirim berkas') "
+    "atau Anda membuat/mengubah berkas yang ingin diserahkan langsung ke pengguna, sertakan baris tersendiri di dalam respons Anda:\n"
+    "MEDIA:/path/ke/file\n"
+    "Sistem bot akan secara otomatis mendeteksi directive tersebut dan mengirimkan berkas asli ke chat Telegram pengguna."
 )
 
 def build_cli_prompt(prompt: str) -> str:
