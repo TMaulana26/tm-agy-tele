@@ -488,6 +488,30 @@ def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optio
 
             if entry_type == "PLANNER_RESPONSE" and last_planner_content is None:
                 content = entry.get("content", "").strip()
+                truncated_fields = entry.get("truncated_fields", [])
+                if "content" in truncated_fields:
+                    full_transcript = transcript_path.parent / "transcript_full.jsonl"
+                    if full_transcript.is_file():
+                        try:
+                            step_idx = entry.get("step_index")
+                            with open(full_transcript, "r", encoding="utf-8", errors="replace") as f_full:
+                                for full_line in f_full:
+                                    if not full_line.strip():
+                                        continue
+                                    try:
+                                        full_entry = json.loads(full_line)
+                                        if (step_idx is not None and full_entry.get("step_index") == step_idx) or (
+                                            step_idx is None and full_entry.get("type") == "PLANNER_RESPONSE"
+                                        ):
+                                            full_content = full_entry.get("content", "").strip()
+                                            if full_content:
+                                                content = full_content
+                                                break
+                                    except Exception:
+                                        continue
+                        except Exception as e_full:
+                            logger.debug(f"Gagal membaca transcript_full.jsonl: {e_full}")
+
                 if content:
                     last_planner_content = content
 
@@ -1422,6 +1446,14 @@ async def execute_agent_turn(
         # 6. Split message safely (<4000 char)
         chunks = split_message(formatted_html, max_length=4000)
 
+        # Stop background typing loop before deleting status bubble to prevent race condition
+        stop_typing.set()
+        typing_task.cancel()
+        try:
+            await asyncio.wait_for(typing_task, timeout=0.5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+
         # Remove temporary waiting bubble
         if status_msg:
             try:
@@ -1454,6 +1486,8 @@ async def execute_agent_turn(
 
     except asyncio.CancelledError:
         logger.info(f"Task user {user_id} dibatalkan.")
+        stop_typing.set()
+        typing_task.cancel()
         if status_msg:
             try:
                 await status_msg.delete()
@@ -1473,6 +1507,8 @@ async def execute_agent_turn(
         raise
     except Exception as e:
         logger.error(f"Error saat mengeksekusi agy: {e}", exc_info=True)
+        stop_typing.set()
+        typing_task.cancel()
         err_msg = (
             f"❌ <b>Terjadi kesalahan saat memproses permintaan:</b>\n"
             f"<pre><code>{html.escape(str(e))[:1000]}</code></pre>\n\n"

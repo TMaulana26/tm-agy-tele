@@ -27,3 +27,10 @@ This repository and VPS environment runs headless Antigravity CLI sessions conne
    - When executing terminal commands that test network connections, WebSocket handshakes, socket listeners, or streaming endpoints (e.g. `curl`, `wget`, `nc`, or WebSocket probe scripts), ALWAYS supply strict explicit timeouts (e.g. `curl --max-time 10 ...`, `wget -T 10 ...`).
    - Do NOT run indefinite streaming commands or WebSocket listeners without exit timeouts, as they will cause the engine subprocess to hang and eventually trigger an execution timeout.
 
+6. **Long Reports & Documents (Anti-Token Exhaustion)**:
+   - When generating lengthy audit reports, extensive code implementations, or in-depth technical analysis:
+   - ALWAYS write the complete detailed report to a Markdown file (`.md`) in the workspace using file creation tools.
+   - In the terminal response delivered to Telegram, output ONLY a concise executive summary accompanied by the directive:
+     `MEDIA:/path/to/report.md`
+   - NEVER attempt to dump pages of full technical reports or code listings into a single terminal turn output, which risks hitting output token generation limits and truncating responses.
+

@@ -113,7 +113,13 @@ SYSTEM_INSTRUCTIONS: str = (
     "Sistem bot akan secara otomatis mendeteksi directive tersebut dan mengirimkan berkas asli ke chat Telegram pengguna.\n"
     "5. BATAS WAKTU PERINTAH JARINGAN (ANTI-HANG): Saat menjalankan perintah terminal pengujian jaringan atau probe socket/streaming "
     "(seperti curl, wget, nc, websocket probe), SELALU gunakan batas waktu ketat (misal: curl --max-time 10 ...) "
-    "agar proses tidak menggantung tanpa batas waktu."
+    "agar proses tidak menggantung tanpa batas waktu.\n"
+    "6. LAPORAN & DOKUMEN PANJANG (ANTI-TOKEN EXHAUSTION): Jika tugas menghasilkan laporan pengujian/audit yang panjang, "
+    "kode implementasi masif, atau analisis teknis mendalam:\n"
+    "   - Tuliskan laporan teknis lengkap ke file Markdown (.md) di direktori kerja menggunakan tool pembuatan berkas.\n"
+    "   - Pada balasan teks terminal ke Telegram, HANYA berikan ringkasan eksekutif singkat dan sertakan baris directive:\n"
+    "     MEDIA:/path/ke/laporan.md\n"
+    "   - JANGAN PERNAH mencetak seluruh laporan teknis berhalaman-halaman hanya pada satu respon teks terminal agar output tidak terpotong batas token."
 )
 
 def build_cli_prompt(prompt: str) -> str:

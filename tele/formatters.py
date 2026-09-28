@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import html
-from typing import Optional
+from typing import Optional, List, Tuple
 
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -140,6 +140,10 @@ def markdown_to_telegram_html(text: str) -> str:
     # 10. Format bullet points (* atau - di awal baris, termasuk ber-indentasi spasi/tab) menjadi simbol bullet rapi (• )
     text = re.sub(r"(?m)^([ \t]*)[\*\-]\s+", r"\1• ", text)
 
+    # 10b. Format triple bold + italic (***text*** atau ___text___) -> <b><i>text</i></b>
+    text = re.sub(r"\*\*\*([^\*\n]+?)\*\*\*", r"<b><i>\1</i></b>", text)
+    text = re.sub(r"___([^_\n]+?)___", r"<b><i>\1</i></b>", text)
+
     # 11. Format bold (**text** atau __text__) -> <b>text</b>
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
@@ -193,7 +197,81 @@ def markdown_to_telegram_html(text: str) -> str:
     # Sanitasi darurat: jika masih ada placeholder yang bocor karena alasan anomali, bersihkan
     text = re.sub(r"\x00?(?:INLINECODE|CODEBLOCK)\d+\x00?", "", text)
 
-    return text.strip()
+    # 15. Pastikan semua tag HTML Telegram seimbang, valid, dan tidak bersilangan
+    return sanitize_and_balance_html(text.strip())
+
+
+def sanitize_and_balance_html(text: str) -> str:
+    """
+    Ensures that HTML tags for Telegram are strictly balanced and valid.
+    1. Tracks opened Telegram tags using a stack.
+    2. Resolves overlapping/crossing tags (e.g. <b>...<i>...</b></i> -> <b>...<i>...</i></b>).
+    3. Drops orphaned closing tags (e.g. </b> without <b>).
+    4. Escapes unsupported HTML tags (&lt;...&gt;).
+    5. Closes any remaining unclosed tags at the end of the text.
+    """
+    if not text:
+        return ""
+
+    allowed_tags = {
+        "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+        "span", "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote"
+    }
+
+    tag_re = re.compile(r"<(/)?([a-zA-Z0-9_-]+)((?:\s+[^>]*)?)>")
+
+    output_parts: List[str] = []
+    open_tags: List[Tuple[str, str]] = []  # list of (tag_name, full_open_tag)
+    last_idx = 0
+
+    for match in tag_re.finditer(text):
+        start, end = match.span()
+        if start > last_idx:
+            output_parts.append(text[last_idx:start])
+        last_idx = end
+
+        is_closing = bool(match.group(1))
+        tag_name = match.group(2).lower()
+        attributes = match.group(3) or ""
+        full_match = match.group(0)
+
+        if tag_name not in allowed_tags:
+            # Escape unsupported tag so it doesn't break Telegram API parser
+            output_parts.append(f"&lt;{match.group(1) or ''}{tag_name}{attributes}&gt;")
+            continue
+
+        if not is_closing:
+            open_tags.append((tag_name, full_match))
+            output_parts.append(full_match)
+        else:
+            if not open_tags:
+                # Orphaned closing tag, discard it
+                continue
+
+            if open_tags[-1][0] == tag_name:
+                open_tags.pop()
+                output_parts.append(f"</{tag_name}>")
+            else:
+                matching_indices = [i for i, (t, _) in enumerate(open_tags) if t == tag_name]
+                if matching_indices:
+                    idx = matching_indices[-1]
+                    tags_to_close = open_tags[idx + 1:]
+                    for t_name, _ in reversed(tags_to_close):
+                        output_parts.append(f"</{t_name}>")
+                    output_parts.append(f"</{tag_name}>")
+                    open_tags = open_tags[:idx]
+                else:
+                    # Tag not in stack, orphaned closing tag: discard it
+                    continue
+
+    if last_idx < len(text):
+        output_parts.append(text[last_idx:])
+
+    # Close any unclosed tags at the end in reverse order
+    for tag_name, _ in reversed(open_tags):
+        output_parts.append(f"</{tag_name}>")
+
+    return "".join(output_parts)
 
 
 def append_duration_badge(formatted_html: str, elapsed_seconds: int) -> str:

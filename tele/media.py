@@ -114,8 +114,8 @@ def extract_media_paths(text: str, workspace_dir: str = WORKSPACE_DIR) -> List[s
     found_paths: List[str] = []
     # Pattern: MEDIA:/path/to/file or MEDIA: /path/to/file or [MEDIA: /path] or BERKAS: or FILE:
     patterns = [
-        r"(?:MEDIA|BERKAS|FILE):\s*([^\s\n\r]+)",
-        r"\[(?:MEDIA|BERKAS|FILE):\s*([^\]]+)\]",
+        r"(?<![a-zA-Z0-9_\-])(?:MEDIA|BERKAS|FILE):\s*(?!//)([^\s\n\r]+)",
+        r"\[(?:MEDIA|BERKAS|FILE):\s*(?!//)([^\]]+)\]",
     ]
 
     for pat in patterns:

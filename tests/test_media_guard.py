@@ -110,6 +110,16 @@ class TestMediaGuard(unittest.TestCase):
         self.assertIn(str(self.voice_file.resolve()), extracted)
 
 
+    def test_extract_media_paths_ignores_file_urls_and_words(self):
+        text = (
+            "Periksa tautan berkas [deploy.sh](file:///home/apps/projects/online-store/deploy.sh) berikut.\n"
+            "Konfigurasi profile: active di environment.\n"
+            "Juga my_file: not a directive."
+        )
+        extracted = extract_media_paths(text, workspace_dir=str(self.ws))
+        self.assertEqual(extracted, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -57,6 +57,32 @@ class TestHtmlSplit(unittest.TestCase):
         self.assertIn("<b>4. [MEDIUM] Bypass Batasan Tenant Admin di", formatted)
         self.assertIn("<code>/tenant/switch</code>", formatted)
 
+    def test_triple_asterisk_and_crossing_tags(self):
+        # Regression test for VPS Step 384 bug with nested italic inside bold ending in ***
+        raw = "1. **[Kritis] Urutan *Permission* di [deploy.sh](file:///deploy.sh) Memicu *Permission Denied (500 Error)***"
+        formatted = markdown_to_telegram_html(raw)
+        self._validate_html_tags(formatted)
+        self.assertIn("Permission Denied (500 Error)", formatted)
+
+    def test_sanitize_and_balance_html_direct(self):
+        from tele.formatters import sanitize_and_balance_html
+        # Crossing tags: <b><i>...</b></i>
+        crossing = "<b>Title <i>Sub</b></i>"
+        balanced = sanitize_and_balance_html(crossing)
+        self._validate_html_tags(balanced)
+        self.assertEqual(balanced, "<b>Title <i>Sub</i></b>")
+
+        # Unclosed tags: <b><i>text
+        unclosed = "<b><i>Unclosed text"
+        balanced2 = sanitize_and_balance_html(unclosed)
+        self._validate_html_tags(balanced2)
+        self.assertEqual(balanced2, "<b><i>Unclosed text</i></b>")
+
+        # Unsupported tags escaped: <script>alert(1)</script>
+        unsupported = "<script>alert(1)</script>"
+        balanced3 = sanitize_and_balance_html(unsupported)
+        self.assertEqual(balanced3, "&lt;script&gt;alert(1)&lt;/script&gt;")
+
 
 if __name__ == "__main__":
     unittest.main()

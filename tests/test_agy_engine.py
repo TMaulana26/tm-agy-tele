@@ -126,6 +126,43 @@ class TestAgyEngine(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(res_file)
             self.assertEqual(res_id, "test-restricted-conv")
 
+    def test_recover_last_response_reads_transcript_full_on_truncated_content(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            conv_id = "test-conv-full-1"
+            conv_dir = tmppath / ".gemini" / "brain" / conv_id
+            log_dir = conv_dir / ".system_generated" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            transcript_file = log_dir / "transcript.jsonl"
+            transcript_full_file = log_dir / "transcript_full.jsonl"
+
+            # In transcript.jsonl, content is truncated and marked in truncated_fields
+            compact_entry = {
+                "step_index": 377,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "# Jal",
+                "truncated_fields": ["content"]
+            }
+            transcript_file.write_text(json.dumps(compact_entry), encoding="utf-8")
+
+            # In transcript_full.jsonl, the content is complete
+            full_entry = {
+                "step_index": 377,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "# Jalankan migration dan deploy script lengkap sampai tuntas!"
+            }
+            transcript_full_file.write_text(json.dumps(full_entry), encoding="utf-8")
+
+            with patch("core.agy_engine.WORKSPACE_DIR", tmpdir):
+                recovered, res_id = agy_engine.recover_last_response_from_transcript(conv_id)
+                self.assertIsNotNone(recovered)
+                self.assertEqual(recovered, "# Jalankan migration dan deploy script lengkap sampai tuntas!")
+                self.assertEqual(res_id, conv_id)
+
 
 if __name__ == "__main__":
     unittest.main()
