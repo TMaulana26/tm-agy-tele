@@ -694,12 +694,13 @@ docker ps -a
 
         context = MagicMock()
         with patch("bot._dispatch_agent_turn", new=AsyncMock()) as mock_dispatch:
-            await bot.handle_message(update, context)
-            mock_dispatch.assert_called_once()
-            dispatched_prompt = mock_dispatch.call_args[0][2]
-            self.assertIn("[MEMBALAS PESAN TA MA]:", dispatched_prompt)
-            self.assertIn("> Coba cek security dari repo tm-agy-tele kang", dispatched_prompt)
-            self.assertIn("[PESAN TERBARU PENGGUNA]:\nCoba ini lagi kang", dispatched_prompt)
+            with patch("bot.TELEGRAM_DEBOUNCE_SECONDS", 0):
+                await bot.handle_message(update, context)
+                mock_dispatch.assert_called_once()
+                dispatched_prompt = mock_dispatch.call_args[0][2]
+                self.assertIn("[MEMBALAS PESAN TA MA]:", dispatched_prompt)
+                self.assertIn("> Coba cek security dari repo tm-agy-tele kang", dispatched_prompt)
+                self.assertIn("[PESAN TERBARU PENGGUNA]:\nCoba ini lagi kang", dispatched_prompt)
 
     # --------------------------------------------------------------------------
     # 11. HEADLESS RESILIENCE & SUBPROCESS TIMEOUT RECOVERY

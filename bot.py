@@ -59,6 +59,9 @@ from config import (
     TELEGRAM_FALLBACK_TRANSPORT,
     TELEGRAM_PROXY,
     AGY_SKIP_PERMISSIONS,
+    TELEGRAM_DEBOUNCE_SECONDS,
+    TELEGRAM_MEDIA_GROUP_SECONDS,
+    TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
     resolve_workspace_dir,
     get_data_dir,
     build_cli_prompt,
@@ -103,6 +106,8 @@ from tele.topics import (
     auto_rename_forum_topic,
 )
 from tele.picker import handle_model_command, handle_model_callback, send_model_picker
+from tele.gating import should_process_chat_message
+from tele.coalescing import TextDebouncer, MediaGroupCollector
 
 # Core Engine & Approval
 from core.approval import (
@@ -140,6 +145,37 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     if user_id not in user_locks:
         user_locks[user_id] = asyncio.Lock()
     return user_locks[user_id]
+
+
+def is_user_busy(user_id: int) -> bool:
+    """Checks whether the user currently has an active running turn task or locked mutex."""
+    task = user_tasks.get(user_id)
+    if task and not task.done():
+        return True
+    lock = user_locks.get(user_id)
+    if lock and lock.locked():
+        return True
+    return False
+
+
+async def _coalesced_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+    """Dispatches coalesced/debounced prompts into agent turn execution."""
+    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
+    await dispatch_fn(update, context, prompt)
+
+
+text_debouncer = TextDebouncer(
+    debounce_seconds=TELEGRAM_DEBOUNCE_SECONDS,
+    dispatch_callback=_coalesced_dispatch,
+    is_busy_func=is_user_busy
+)
+
+media_group_collector = MediaGroupCollector(
+    window_seconds=TELEGRAM_MEDIA_GROUP_SECONDS,
+    upload_dir_func=get_upload_dir,
+    dispatch_callback=_coalesced_dispatch,
+    is_busy_func=is_user_busy
+)
 
 
 # ==============================================================================
@@ -1584,7 +1620,34 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.message or not update.message.photo:
         return
 
+    # Group chat mention & reply gating
+    bot_id = getattr(context.bot, "id", None)
+    raw_username = getattr(context.bot, "username", "")
+    bot_username = raw_username if isinstance(raw_username, str) else ""
+    caption = (update.message.caption or "").strip()
+    should_proc, _ = should_process_chat_message(
+        update,
+        bot_id=bot_id,
+        bot_username=bot_username,
+        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
+        text=caption
+    )
+    if not should_proc:
+        return
+
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    media_group_id = getattr(update.message, "media_group_id", None)
+
+    # Route multi-photo albums to MediaGroupCollector
+    if isinstance(media_group_id, str) and media_group_id.strip():
+        collector = getattr(sys.modules[__name__], "media_group_collector", media_group_collector)
+        enqueued = await collector.enqueue(
+            update, context, chat_id=chat_id, user_id=user_id, media_group_id=str(media_group_id)
+        )
+        if enqueued:
+            return
+
     photo = update.message.photo[-1]
 
     try:
@@ -1603,7 +1666,6 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 await safe_send_message(context.bot, update.effective_chat.id, f"❌ Gagal mengunduh foto: {e}")
         return
 
-    caption = (update.message.caption or "").strip()
     caption_prompt = caption if caption else "Tolong periksa dan analisis gambar terlampir ini."
     if update.message and getattr(update.message, "reply_to_message", None):
         caption_prompt = format_reply_context(update.message, caption_prompt)
@@ -1623,6 +1685,21 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     if not is_authorized(update):
         return
     if not update.message or not update.message.document:
+        return
+
+    # Group chat mention & reply gating
+    bot_id = getattr(context.bot, "id", None)
+    raw_username = getattr(context.bot, "username", "")
+    bot_username = raw_username if isinstance(raw_username, str) else ""
+    caption = (update.message.caption or "").strip()
+    should_proc, _ = should_process_chat_message(
+        update,
+        bot_id=bot_id,
+        bot_username=bot_username,
+        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
+        text=caption
+    )
+    if not should_proc:
         return
 
     user_id = update.effective_user.id
@@ -1651,7 +1728,6 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
                 await safe_send_message(context.bot, update.effective_chat.id, f"❌ Gagal mengunduh dokumen: {e}")
         return
 
-    caption = (update.message.caption or "").strip()
     caption_prompt = caption if caption else "Tolong periksa, baca, dan analisis dokumen terlampir ini."
     if update.message and getattr(update.message, "reply_to_message", None):
         caption_prompt = format_reply_context(update.message, caption_prompt)
@@ -1676,6 +1752,21 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg or not (msg.voice or msg.audio):
         return
 
+    # Group chat mention & reply gating
+    bot_id = getattr(context.bot, "id", None)
+    raw_username = getattr(context.bot, "username", "")
+    bot_username = raw_username if isinstance(raw_username, str) else ""
+    caption = (msg.caption or "").strip()
+    should_proc, _ = should_process_chat_message(
+        update,
+        bot_id=bot_id,
+        bot_username=bot_username,
+        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
+        text=caption
+    )
+    if not should_proc:
+        return
+
     media = msg.voice or msg.audio
     user_id = update.effective_user.id
 
@@ -1693,7 +1784,6 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await msg.reply_text(f"❌ Gagal mengunduh pesan suara: {e}")
         return
 
-    caption = (msg.caption or "").strip()
     prompt_text = (
         f"[PENGGUNA MENGIRIMKAN REKAMAN SUARA / VOICE NOTE]\n"
         f"Berkas audio tersimpan di: {dest_path}\n\n"
@@ -1723,6 +1813,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     raw_username = getattr(context.bot, "username", "")
     bot_username = raw_username if isinstance(raw_username, str) else ""
+    bot_id = getattr(context.bot, "id", None)
+
+    # Group chat mention & reply gating
+    should_proc, user_text = should_process_chat_message(
+        update,
+        bot_id=bot_id,
+        bot_username=bot_username,
+        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
+        text=user_text
+    )
+    if not should_proc:
+        return
+
     user_text = clean_bot_mentions(user_text, bot_username)
 
     if not user_text.strip():
@@ -1753,8 +1856,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and getattr(update.message, "reply_to_message", None):
         user_text = format_reply_context(update.message, user_text)
 
+    # Route through TextDebouncer if debounce window is active (>0)
+    debounce_sec = getattr(sys.modules[__name__], "TELEGRAM_DEBOUNCE_SECONDS", TELEGRAM_DEBOUNCE_SECONDS)
     dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    await dispatch_fn(update, context, user_text)
+    if debounce_sec > 0:
+        debouncer = getattr(sys.modules[__name__], "text_debouncer", text_debouncer)
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        enqueued = await debouncer.enqueue(
+            update, context, user_text, chat_id=chat_id, user_id=user_id, thread_id=thread_id
+        )
+        if not enqueued:
+            await dispatch_fn(update, context, user_text)
+    else:
+        await dispatch_fn(update, context, user_text)
 
 
 # ==============================================================================
@@ -1786,6 +1901,12 @@ async def post_init(application):
 async def post_shutdown(application):
     """Cleans up running subprocesses and state on shutdown."""
     logger.info("Menutup seluruh subprocess Antigravity...")
+    try:
+        await text_debouncer.cancel_all()
+        await media_group_collector.cancel_all()
+    except Exception:
+        pass
+
     for user_id, proc in list(user_processes.items()):
         try:
             if proc.returncode is None:

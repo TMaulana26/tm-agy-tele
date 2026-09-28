@@ -97,6 +97,15 @@ TELEGRAM_FALLBACK_TRANSPORT: bool = os.getenv(
 TELEGRAM_PROXY: str = os.getenv("TELEGRAM_PROXY", "").strip()
 
 # ==============================================================================
+# INGRESS COALESCING & GROUP GATING
+# ==============================================================================
+TELEGRAM_DEBOUNCE_SECONDS: float = float(os.getenv("TELEGRAM_DEBOUNCE_SECONDS", "1.2"))
+TELEGRAM_MEDIA_GROUP_SECONDS: float = float(os.getenv("TELEGRAM_MEDIA_GROUP_SECONDS", "1.5"))
+TELEGRAM_REQUIRE_MENTION_IN_GROUPS: bool = os.getenv(
+    "TELEGRAM_REQUIRE_MENTION_IN_GROUPS", "true"
+).strip().lower() in ("true", "1", "yes")
+
+# ==============================================================================
 # HEADLESS SYSTEM INSTRUCTIONS
 # ==============================================================================
 SYSTEM_INSTRUCTIONS: str = (
