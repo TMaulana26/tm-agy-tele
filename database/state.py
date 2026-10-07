@@ -51,6 +51,9 @@ class StateDatabase:
                     thread_id TEXT NOT NULL,
                     conv_id TEXT NOT NULL,
                     topic_name TEXT,
+                    workspace_path TEXT,
+                    model_override TEXT,
+                    system_prompt TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (chat_id, thread_id)
@@ -76,8 +79,19 @@ class StateDatabase:
                 ON telegram_update_receipts(created_at);
             """)
 
+            # Dynamic column migration for existing databases
+            for col, col_type in [
+                ("workspace_path", "TEXT"),
+                ("model_override", "TEXT"),
+                ("system_prompt", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE telegram_dm_topic_bindings ADD COLUMN {col} {col_type};")
+                except sqlite3.OperationalError:
+                    pass
+
     # --------------------------------------------------------------------------
-    # TOPIC BINDINGS
+    # TOPIC BINDINGS & WORKSPACE ROUTING
     # --------------------------------------------------------------------------
     def get_topic_binding(self, chat_id: Any, thread_id: Any) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
@@ -90,23 +104,38 @@ class StateDatabase:
                 return dict(row)
         return None
 
+    def get_topic_workspace(self, chat_id: Any, thread_id: Any) -> Optional[str]:
+        """Returns custom workspace path for the given forum topic if configured."""
+        binding = self.get_topic_binding(chat_id, thread_id)
+        if binding and binding.get("workspace_path"):
+            return binding["workspace_path"]
+        return None
+
     def set_topic_binding(
         self,
         chat_id: Any,
         thread_id: Any,
         conv_id: str,
-        topic_name: Optional[str] = None
+        topic_name: Optional[str] = None,
+        workspace_path: Optional[str] = None,
+        model_override: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ) -> None:
         now = time.time()
         with self._get_connection() as conn:
             conn.execute("""
-                INSERT INTO telegram_dm_topic_bindings (chat_id, thread_id, conv_id, topic_name, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO telegram_dm_topic_bindings (
+                    chat_id, thread_id, conv_id, topic_name, workspace_path, model_override, system_prompt, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, thread_id) DO UPDATE SET
                     conv_id = excluded.conv_id,
                     topic_name = COALESCE(excluded.topic_name, telegram_dm_topic_bindings.topic_name),
+                    workspace_path = COALESCE(excluded.workspace_path, telegram_dm_topic_bindings.workspace_path),
+                    model_override = COALESCE(excluded.model_override, telegram_dm_topic_bindings.model_override),
+                    system_prompt = COALESCE(excluded.system_prompt, telegram_dm_topic_bindings.system_prompt),
                     updated_at = excluded.updated_at
-            """, (str(chat_id), str(thread_id), conv_id, topic_name, now, now))
+            """, (str(chat_id), str(thread_id), conv_id, topic_name, workspace_path, model_override, system_prompt, now, now))
 
     def update_topic_name(self, chat_id: Any, thread_id: Any, topic_name: str) -> None:
         now = time.time()
@@ -123,6 +152,15 @@ class StateDatabase:
                 "DELETE FROM telegram_dm_topic_bindings WHERE chat_id = ? AND thread_id = ?",
                 (str(chat_id), str(thread_id))
             )
+
+    def prune_stale_topic_binding(self, chat_id: Any, thread_id: Any) -> bool:
+        """Prunes orphaned topic binding when thread was deleted or not found in Telegram (Hermes #31501)."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM telegram_dm_topic_bindings WHERE chat_id = ? AND thread_id = ?",
+                (str(chat_id), str(thread_id))
+            )
+            return cur.rowcount > 0
 
     def list_topic_bindings(self, chat_id: Any) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:

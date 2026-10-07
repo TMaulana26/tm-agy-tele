@@ -8,10 +8,12 @@ Adapted from hermes-agent/plugins/platforms/telegram/adapter.py and hermes_state
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 import logging
-from typing import Optional, Tuple, Dict, Any
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any, List, Union
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
@@ -21,10 +23,46 @@ from database.state import get_db
 logger = logging.getLogger("antigravity-tele-bot.topics")
 
 
+def parse_topic_args(args: Union[str, List[str]]) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Parses /topic arguments extracting topic name, optional --path=..., and optional --model=...
+    Supports either a list of token strings or a raw prompt string.
+    Example: /topic Backend API --path=/var/www/backend --model=claude-sonnet-4-6
+    """
+    if isinstance(args, str):
+        import shlex
+        try:
+            arg_list = shlex.split(args, posix=False)
+        except Exception:
+            arg_list = args.split()
+    else:
+        arg_list = args
+
+    name_parts = []
+    workspace_path = None
+    model_override = None
+    for arg in arg_list:
+        if arg.startswith("--path="):
+            raw_path = arg[len("--path="):].strip()
+            if raw_path:
+                p = Path(raw_path).expanduser().resolve()
+                try:
+                    p.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    pass
+                workspace_path = str(p)
+        elif arg.startswith("--model="):
+            model_override = arg[len("--model="):].strip()
+        else:
+            name_parts.append(arg)
+    name = " ".join(name_parts).strip()
+    return name, workspace_path, model_override
+
+
 async def handle_topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handles /topic command in Telegram private DM.
-    If arguments given (/topic <nama>), creates a forum topic directly with that name.
+    If arguments given (/topic <nama> [--path=...] [--model=...]), creates a forum topic directly.
     If no arguments, checks Threaded Mode and ensures General topic.
     """
     chat = update.effective_chat
@@ -52,8 +90,17 @@ async def handle_topic_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     db = get_db()
-    args = context.args if context.args else []
-    custom_name = " ".join(args).strip() if args else ""
+    args = list(context.args) if context.args else []
+    custom_name, custom_path, model_override = parse_topic_args(args)
+
+    if custom_path:
+        p = Path(custom_path).expanduser().resolve()
+        if not p.exists():
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+            except Exception as pe:
+                logger.warning(f"Could not auto-create custom workspace {p}: {pe}")
+        custom_path = str(p)
 
     # Case A: User provided a custom topic name (/topic <nama>)
     if custom_name:
@@ -61,14 +108,28 @@ async def handle_topic_command(update: Update, context: ContextTypes.DEFAULT_TYP
             topic = await bot.create_forum_topic(chat_id=chat.id, name=custom_name)
             new_thread_id = topic.message_thread_id
             new_conv_id = str(uuid.uuid4())
-            db.set_topic_binding(chat.id, new_thread_id, conv_id=new_conv_id, topic_name=custom_name)
-            logger.info(f"Created custom forum topic '{custom_name}' for chat {chat.id} (thread_id: {new_thread_id})")
+            db.set_topic_binding(
+                chat.id,
+                new_thread_id,
+                conv_id=new_conv_id,
+                topic_name=custom_name,
+                workspace_path=custom_path,
+                model_override=model_override
+            )
+            logger.info(f"Created custom forum topic '{custom_name}' for chat {chat.id} (thread_id: {new_thread_id}, ws: {custom_path})")
+
+            details = []
+            if custom_path:
+                details.append(f"📁 <b>Workspace</b>: <code>{custom_path}</code>")
+            if model_override:
+                details.append(f"🤖 <b>Model</b>: <code>{model_override}</code>")
+            extra_desc = ("\n" + "\n".join(details)) if details else ""
 
             # Send welcome message into the new topic
             await bot.send_message(
                 chat_id=chat.id,
                 message_thread_id=new_thread_id,
-                text=f"🚀 <b>Topik Baru: {custom_name}</b>\n\nSesi percakapan Antigravity untuk topik ini telah siap dan terisolasi secara mandiri.",
+                text=f"🚀 <b>Topik Baru: {custom_name}</b>{extra_desc}\n\nSesi percakapan Antigravity untuk topik ini telah siap dan terisolasi secara mandiri.",
                 parse_mode=ParseMode.HTML
             )
             if update.message:
@@ -94,10 +155,11 @@ async def handle_topic_command(update: Update, context: ContextTypes.DEFAULT_TYP
     success_text = (
         "🎉 <b>Mode Topik Multi-Sesi Aktif!</b>\n\n"
         "Anda dapat membuat topik baru dengan cara:\n"
-        "• Ketik: <code>/topic [Nama Topik]</code> (contoh: <code>/topic Refactor Modul Auth</code>)\n"
+        "• Ketik: <code>/topic [Nama Topik] [--path=/path/ke/proyek] [--model=nama-model]</code>\n"
+        "  <i>Contoh: <code>/topic WebApp --path=/var/www/webapp --model=gemini-3.1-pro-high</code></i>\n"
         "• Atau tekan tombol <b>+ (New Topic)</b> di Telegram.\n\n"
         "✨ <b>Perintah Kelola Topik:</b>\n"
-        "• <code>/topics</code> : Lihat daftar semua topik aktif\n"
+        "• <code>/topics</code> : Lihat daftar semua topik aktif & direktori workspace\n"
         "• <code>/title [Nama Baru]</code> : Ganti nama topik aktif saat ini\n"
         "• <code>/deletetopic</code> : Hapus topik aktif saat ini\n"
         "• <code>/reset</code> : Bersihkan riwayat memori sesi topik ini"
@@ -122,8 +184,8 @@ async def handle_topics_command(update: Update, context: ContextTypes.DEFAULT_TY
         text = (
             "📋 <b>Belum Ada Topik Terdaftar</b>\n\n"
             "Anda sedang berada di sesi chat utama (Lobby). Untuk membuat topik baru, ketik:\n"
-            "<code>/topic &lt;nama topik&gt;</code>\n"
-            "Contoh: <code>/topic Refactor Auth</code>"
+            "<code>/topic &lt;nama topik&gt; [--path=/direktori]</code>\n"
+            "Contoh: <code>/topic Refactor Auth --path=/var/www/auth</code>"
         )
         if update.message:
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -136,7 +198,9 @@ async def handle_topics_command(update: Update, context: ContextTypes.DEFAULT_TY
         conv = b.get("conv_id") or "Belum dimulai"
         short_conv = f"<code>{conv[:8]}...</code>" if len(conv) > 8 else f"<code>{conv}</code>"
         is_current = " 👈 <i>(Topik ini)</i>" if thread_id is not None and str(thread_id) == str(tid) else ""
-        lines.append(f"{idx}. 💬 <b>{name}</b> (Thread ID: <code>{tid}</code>){is_current}\n   └ Sesi: {short_conv}")
+        ws_info = f"\n   └ Workspace: <code>{b.get('workspace_path')}</code>" if b.get('workspace_path') else ""
+        model_info = f" | Model: <code>{b.get('model_override')}</code>" if b.get('model_override') else ""
+        lines.append(f"{idx}. 💬 <b>{name}</b> (Thread ID: <code>{tid}</code>){is_current}\n   └ Sesi: {short_conv}{model_info}{ws_info}")
 
     lines.append("\n💡 <i>Gunakan <code>/title [nama]</code> untuk ganti nama, atau <code>/deletetopic</code> untuk menghapus topik aktif.</i>")
     if update.message:

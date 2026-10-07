@@ -96,6 +96,20 @@ TELEGRAM_FALLBACK_TRANSPORT: bool = os.getenv(
 
 TELEGRAM_PROXY: str = os.getenv("TELEGRAM_PROXY", "").strip()
 
+# Webhook Dual-Mode & Secrets (GHSA-3vpc-7q5r-276h guard)
+TELEGRAM_WEBHOOK_URL: str = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+TELEGRAM_WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+TELEGRAM_WEBHOOK_PORT: int = int(os.getenv("TELEGRAM_WEBHOOK_PORT", os.getenv("PORT", "8443")))
+TELEGRAM_WEBHOOK_LISTEN: str = os.getenv("TELEGRAM_WEBHOOK_LISTEN", "0.0.0.0").strip()
+
+# Watchdog & Health Guards
+TELEGRAM_POLLING_STALL_TIMEOUT: float = float(os.getenv("TELEGRAM_POLLING_STALL_TIMEOUT", "120.0"))
+
+# Media & Speech Intelligence
+TELEGRAM_IMAGE_PRECOMPRESS: bool = os.getenv("TELEGRAM_IMAGE_PRECOMPRESS", "true").strip().lower() in ("true", "1", "yes")
+TELEGRAM_STT_ENABLED: bool = os.getenv("TELEGRAM_STT_ENABLED", "true").strip().lower() in ("true", "1", "yes")
+TELEGRAM_WHISPER_MODEL: str = os.getenv("TELEGRAM_WHISPER_MODEL", "base").strip()
+
 # ==============================================================================
 # INGRESS COALESCING & GROUP GATING
 # ==============================================================================

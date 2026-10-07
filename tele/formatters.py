@@ -303,3 +303,87 @@ def strip_html_for_plain_text(html_text: str) -> str:
     # Unescape HTML entities (&amp; -> &, &lt; -> <, &gt; -> >, &#x27; -> ', etc.)
     return html.unescape(clean)
 
+
+# ==============================================================================
+# TREE-AWARE MARKDOWN CHUNKING & CODE BLOCK PRESERVATION (ALA HERMES)
+# ==============================================================================
+def fence_state_after(text: str, in_code: bool = False, lang: str = "") -> Tuple[bool, str]:
+    """
+    Walk text line by line toggling on ``` lines.
+    Returns (in_code, language_tag).
+    """
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            tag = stripped[3:].split()
+            in_code, lang = (False, "") if in_code else (True, tag[0] if tag else "")
+    return in_code, lang
+
+
+def truncate_message(
+    content: str,
+    max_length: int = 4000,
+    len_fn: Optional[Any] = None
+) -> List[str]:
+    """
+    Splits a long Markdown message into chunks preserving code fences:
+    A split inside a code block closes the fence at the chunk end (```) and
+    reopens it with the same language tag (```{lang}) in the next chunk.
+    Multi-chunk output receives pagination indicators (1/N).
+    Adapted from hermes-agent gateway/platforms/base.py.
+    """
+    _len = len_fn or len
+    if _len(content) <= max_length:
+        return [content]
+
+    INDICATOR_RESERVE = 16
+    FENCE_CLOSE = "\n```"
+    chunks: List[str] = []
+    remaining = content
+    carry_lang: Optional[str] = None
+
+    while remaining:
+        prefix = f"```{carry_lang}\n" if carry_lang is not None else ""
+        headroom = max_length - INDICATOR_RESERVE - _len(prefix) - _len(FENCE_CLOSE)
+        if headroom < 1:
+            headroom = max(1, max_length // 2)
+
+        if _len(prefix) + _len(remaining) <= max_length - INDICATOR_RESERVE:
+            final_chunk = prefix + remaining
+            if carry_lang is not None and fence_state_after(remaining, True, carry_lang)[0]:
+                final_chunk += FENCE_CLOSE
+            chunks.append(final_chunk)
+            break
+
+        region = remaining[:headroom]
+        split_at = region.rfind("\n")
+        if split_at < headroom // 2:
+            split_at = region.rfind(" ")
+        if split_at < 1:
+            split_at = max(1, headroom)
+
+        # Avoid splitting inside inline code span
+        candidate = remaining[:split_at]
+        backtick_count = candidate.count("`") - candidate.count("\\`")
+        if backtick_count % 2 == 1:
+            last_bt = candidate.rfind("`")
+            while last_bt > 0 and candidate[last_bt - 1] == "\\":
+                last_bt = candidate.rfind("`", 0, last_bt)
+            if last_bt > 0:
+                safe_split = max(candidate.rfind(" ", 0, last_bt), candidate.rfind("\n", 0, last_bt))
+                if safe_split > headroom // 4:
+                    split_at = safe_split
+
+        chunk_body = remaining[:split_at]
+        remaining = remaining[split_at:].lstrip()
+        full_chunk = prefix + chunk_body
+
+        in_code, lang = fence_state_after(chunk_body, carry_lang is not None, carry_lang or "")
+        carry_lang = lang if in_code else None
+
+        chunks.append(full_chunk + FENCE_CLOSE if in_code else full_chunk)
+
+    if len(chunks) > 1:
+        chunks = [f"{chunk} ({i + 1}/{len(chunks)})" for i, chunk in enumerate(chunks)]
+    return chunks
+

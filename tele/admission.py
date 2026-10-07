@@ -64,8 +64,29 @@ def is_update_admitted(bot_id: Any, update_id: Any) -> bool:
     return True
 
 
+_progress_listener: Optional[Callable[[], None]] = None
+
+
+def set_progress_listener(listener: Optional[Callable[[], None]]) -> None:
+    """Sets a global callback invoked on every newly admitted update (e.g. for PollingStallWatchdog)."""
+    global _progress_listener
+    _progress_listener = listener
+
+
+def notify_progress() -> None:
+    """Notifies watchdog of inbound progress."""
+    if _progress_listener:
+        try:
+            _progress_listener()
+        except Exception:
+            pass
+
+
 def check_update_admission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Helper for PTB handler functions."""
     bot_id = getattr(context.bot, "id", "default_bot")
     update_id = getattr(update, "update_id", None)
-    return is_update_admitted(bot_id, update_id)
+    admitted = is_update_admitted(bot_id, update_id)
+    if admitted:
+        notify_progress()
+    return admitted

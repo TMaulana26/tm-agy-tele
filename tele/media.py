@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import logging
 from pathlib import Path
 from typing import List, Tuple, Optional, Any
@@ -159,6 +160,97 @@ def classify_media_type(file_path: str) -> str:
     return "document"
 
 
+def sniff_raster_format(file_or_bytes: Union[str, Path, bytes]) -> Optional[str]:
+    """Sniffs raster image format by checking file magic bytes (Hermes standard)."""
+    try:
+        if isinstance(file_or_bytes, (bytes, bytearray)):
+            header = bytes(file_or_bytes[:16])
+        else:
+            p = Path(file_or_bytes)
+            if not p.is_file():
+                return None
+            with open(p, "rb") as f:
+                header = f.read(16)
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        elif header.startswith(b"\xff\xd8\xff"):
+            return "jpeg"
+        elif header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+            return "gif"
+        elif header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP":
+            return "webp"
+        elif header.startswith(b"BM"):
+            return "bmp"
+        elif header.startswith(b"II*\x00") or header.startswith(b"MM\x00*"):
+            return "tiff"
+        return None
+    except Exception:
+        return None
+
+
+def compress_image_to_jpeg(
+    file_path: str,
+    max_dimension: int = 1600,
+    quality: int = 85,
+    threshold_bytes: int = 1_000_000,
+    max_dim: Optional[int] = None
+) -> str:
+    """
+    Pre-compresses large images to progressive JPEG (resizing above max_dimension).
+    Prevents PTB media write timeout and Telegram 10MB photo cap over slow VPS connections.
+    Adapted from hermes-agent gateway/platforms/telegram/adapter.py.
+    """
+    if max_dim is not None:
+        max_dimension = max_dim
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.debug("Pillow not installed; skipping image pre-compression.")
+        return file_path
+
+    try:
+        p = Path(file_path)
+        if not p.is_file():
+            return file_path
+
+        fmt = sniff_raster_format(file_path)
+        if fmt is None:
+            return file_path
+
+        file_size = p.stat().st_size
+        with Image.open(file_path) as img:
+            width, height = img.size
+            if file_size < threshold_bytes and max(width, height) <= max_dimension and fmt == "jpeg":
+                return file_path
+
+            # Scale dimensions preserving aspect ratio
+            if max(width, height) > max_dimension:
+                scale = max_dimension / max(width, height)
+                new_size = (int(width * scale), int(height * scale))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            # Convert to RGB (composite transparent RGBA over white background)
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode != "RGBA":
+                    img = img.convert("RGBA")
+                bg.paste(img, mask=img.split()[-1])
+                rgb_img = bg
+            elif img.mode != "RGB":
+                rgb_img = img.convert("RGB")
+            else:
+                rgb_img = img
+
+            compressed_name = f"opt_{p.stem}_{int(time.time())}.jpg"
+            out_path = p.parent / compressed_name
+            rgb_img.save(out_path, "JPEG", quality=quality, progressive=True, optimize=True)
+            logger.info(f"Pre-compressed image {p.name} ({file_size // 1024} KB) -> {compressed_name} ({out_path.stat().st_size // 1024} KB)")
+            return str(out_path)
+    except Exception as e:
+        logger.warning(f"Image pre-compression failed for '{file_path}': {e}. Using original file.")
+        return file_path
+
+
 async def send_outbound_media(
     bot: Bot,
     chat_id: int,
@@ -178,6 +270,9 @@ async def send_outbound_media(
         return None
 
     media_type = classify_media_type(file_path)
+    if media_type == "photo":
+        file_path = compress_image_to_jpeg(file_path)
+
     filename = Path(file_path).name
 
     effective_thread = message_thread_id if isinstance(message_thread_id, int) else None

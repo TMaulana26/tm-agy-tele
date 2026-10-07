@@ -62,6 +62,14 @@ from config import (
     TELEGRAM_DEBOUNCE_SECONDS,
     TELEGRAM_MEDIA_GROUP_SECONDS,
     TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
+    TELEGRAM_WEBHOOK_URL,
+    TELEGRAM_WEBHOOK_SECRET,
+    TELEGRAM_WEBHOOK_PORT,
+    TELEGRAM_WEBHOOK_LISTEN,
+    TELEGRAM_POLLING_STALL_TIMEOUT,
+    TELEGRAM_IMAGE_PRECOMPRESS,
+    TELEGRAM_STT_ENABLED,
+    TELEGRAM_WHISPER_MODEL,
     resolve_workspace_dir,
     get_data_dir,
     build_cli_prompt,
@@ -79,9 +87,26 @@ def get_upload_dir() -> Path:
 from database.state import get_db, StateDatabase
 
 # Telegram Platform Components
-from tele.network import build_resilient_request, TelegramFallbackTransport
-from tele.admission import check_update_admission, is_update_admitted
+from tele.network import (
+    build_resilient_request,
+    TelegramFallbackTransport,
+    redact_telegram_error_text,
+    acquire_instance_lock,
+    release_instance_lock,
+    PollingStallWatchdog,
+)
+from tele.admission import check_update_admission, is_update_admitted, set_progress_listener
 from tele.entities import expand_link_entities, clean_bot_mentions, format_reply_context
+from tele.clarify import (
+    detect_clarify_options,
+    build_clarify_keyboard,
+    build_slash_confirm_keyboard,
+    register_clarification,
+    pop_clarification,
+    register_slash_confirm,
+    pop_slash_confirm,
+)
+from tele.stt import transcribe_audio_file
 from tele.media import (
     validate_media_delivery_path,
     extract_media_paths,
@@ -177,6 +202,13 @@ media_group_collector = MediaGroupCollector(
     is_busy_func=is_user_busy
 )
 
+# Polling Stall Watchdog (Heartbeat & CLOSE-WAIT hang prevention)
+stall_watchdog = PollingStallWatchdog(
+    stall_timeout=TELEGRAM_POLLING_STALL_TIMEOUT,
+    probe_interval=20.0
+)
+set_progress_listener(stall_watchdog.record_progress)
+
 
 # ==============================================================================
 # AUTHORIZATION & UTILITIES
@@ -245,6 +277,24 @@ async def safe_send_message(
                 err_str = str(e).lower()
             except Exception as e_retry:
                 logger.error(f"Gagal mengirim ulang pesan: {e_retry}")
+                return None
+
+        # 1b. If thread not found (topic deleted in Telegram), prune stale topic binding and retry without thread_id
+        if "thread" in err_str and effective_thread is not None:
+            logger.warning(f"Thread {effective_thread} tidak ditemukan ({e}). Memangkas binding usang dan mengirim ulang...")
+            try:
+                get_db().prune_stale_topic_binding(chat_id, effective_thread)
+            except Exception:
+                pass
+            retry_thread_kwargs = dict(send_kwargs)
+            retry_thread_kwargs.pop("message_thread_id", None)
+            try:
+                return await bot.send_message(**retry_thread_kwargs)
+            except BadRequest as e_thread:
+                e = e_thread
+                err_str = str(e).lower()
+            except Exception as e_thread:
+                logger.error(f"Gagal mengirim ulang tanpa thread: {e_thread}")
                 return None
 
         # 2. Fallback to plain text if formatting error occurred
@@ -1007,10 +1057,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send_message(context.bot, chat_id, status_text, reply_markup=status_kb, parse_mode=ParseMode.MARKDOWN, message_thread_id=thread_id)
 
 
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
+async def perform_reset_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Executes actual session reset, PID cancellation, and memory purge."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     thread_id = get_effective_thread_id(update)
@@ -1058,6 +1106,14 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
         message_thread_id=thread_id
     )
+
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /reset command to clear conversation memory and cancel running tasks."""
+    if not is_authorized(update):
+        return
+
+    await perform_reset_execution(update, context)
 
 
 async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1236,6 +1292,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     if data.startswith("appr:") or data.startswith("deny:"):
         await handle_approval_callback(update, context)
+    elif data.startswith("cl:"):
+        await handle_clarify_callback(update, context)
+    elif data.startswith("sc:"):
+        await handle_slash_confirm_callback(update, context)
     elif data.startswith("model_"):
         await handle_model_callback(update, context)
     elif data.startswith("help:"):
@@ -1263,6 +1323,104 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await safe_edit_message(query.message, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
         except Exception as e:
             await query.answer(f"Gagal refresh: {e}", show_alert=True)
+
+
+async def handle_clarify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles taps on clarify single-choice question buttons (Hermes standard)."""
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        return
+
+    clarify_id = parts[1]
+    choice_idx = parts[2]
+    user_id = update.effective_user.id
+    chat_id = query.message.chat_id if query.message else update.effective_chat.id
+    thread_id = get_effective_thread_id(update)
+
+    clarify_data = pop_clarification(clarify_id)
+    if not clarify_data:
+        await query.answer("Pertanyaan ini sudah dijawab atau kedaluwarsa.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if choice_idx == "other":
+        await query.answer()
+        await safe_edit_message(
+            query.message,
+            "✏️ <b>Mode Jawaban Manual:</b>\nSilakan ketik jawaban Anda secara langsung di chat ini.",
+            reply_markup=None,
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        idx = int(choice_idx)
+        selected_text = clarify_data["choices"][idx]
+    except (ValueError, IndexError):
+        selected_text = f"Pilihan #{choice_idx}"
+
+    await query.answer(f"Memilih: {selected_text[:30]}")
+    await safe_edit_message(
+        query.message,
+        f"✅ <i>Pilihan dipilih:</i> <b>{html.escape(selected_text)}</b>",
+        reply_markup=None,
+        parse_mode=ParseMode.HTML
+    )
+
+    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
+    await dispatch_fn(update, context, selected_text)
+
+
+async def handle_slash_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles confirmation for destructive slash commands (/reset, /cancel)."""
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        return
+
+    confirm_id = parts[1]
+    action = parts[2]
+
+    confirm_data = pop_slash_confirm(confirm_id)
+    if not confirm_data:
+        await query.answer("Konfirmasi sudah kedaluwarsa.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    cmd = confirm_data.get("command", "")
+    if action == "approve":
+        await query.answer("Dikonfirmasi!")
+        await safe_edit_message(
+            query.message,
+            f"⏳ <i>Mengeksekusi {html.escape(cmd)}...</i>",
+            reply_markup=None,
+            parse_mode=ParseMode.HTML
+        )
+        if cmd == "/reset":
+            await perform_reset_execution(update, context)
+        elif cmd == "/cancel":
+            await cancel_command(update, context)
+    else:
+        await query.answer("Dibatalkan.")
+        await safe_edit_message(
+            query.message,
+            f"❌ <i>Perintah {html.escape(cmd)} dibatalkan.</i>",
+            reply_markup=None,
+            parse_mode=ParseMode.HTML
+        )
 
 
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1400,8 +1558,12 @@ async def execute_agent_turn(
     if not active_conv:
         active_conv = user_conversations.get(user_id)
 
-    active_model = db.get_user_model(user_id, chat_id, thread_id or "root") or DEFAULT_MODEL
-    current_workspace = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
+    topic_binding = db.get_topic_binding(chat_id, thread_id) if thread_id is not None else None
+    topic_workspace = topic_binding.get("workspace_path") if topic_binding else None
+    current_workspace = topic_workspace or globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
+
+    topic_model = topic_binding.get("model_override") if topic_binding else None
+    active_model = topic_model or db.get_user_model(user_id, chat_id, thread_id or "root") or DEFAULT_MODEL
     turn_success = False
 
     run_fn = getattr(sys.modules[__name__], "run_agy_cli", run_agy_cli)
@@ -1498,12 +1660,29 @@ async def execute_agent_turn(
                 pass
             status_msg = None
 
+        # Check if the output text has structured clarification / choice options
+        clarify_detect = detect_clarify_options(output_text)
+        clarify_kb = None
+        if clarify_detect:
+            _, options = clarify_detect
+            clarify_id = str(uuid.uuid4())[:8]
+            register_clarification(clarify_id, {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "choices": options
+            })
+            clarify_kb = build_clarify_keyboard(clarify_id, options)
+
         # Send formatted chunks
         for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            chunk_markup = clarify_kb if is_last else None
             await safe_send_message(
                 context.bot,
                 chat_id,
                 chunk,
+                reply_markup=chunk_markup,
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=reply_id if i == 0 else None,
                 message_thread_id=thread_id,
@@ -1745,11 +1924,11 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inbound Voice Note / Audio memo handler."""
+    """Inbound Voice Note handler (Opus/OGG voice bubble) with Speech-to-Text (STT)."""
     if not is_authorized(update):
         return
     msg = update.message
-    if not msg or not (msg.voice or msg.audio):
+    if not msg or not msg.voice:
         return
 
     # Group chat mention & reply gating
@@ -1767,28 +1946,103 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not should_proc:
         return
 
-    media = msg.voice or msg.audio
     user_id = update.effective_user.id
 
     try:
-        file_obj = await media.get_file()
-        ext = ".ogg" if msg.voice else ".mp3"
-        filename = f"voice_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+        file_obj = await msg.voice.get_file()
+        filename = f"voice_{int(time.time())}_{uuid.uuid4().hex[:6]}.ogg"
         upload_dir = get_upload_dir()
         dest_path = (upload_dir / filename).resolve()
         await file_obj.download_to_drive(custom_path=dest_path)
         logger.info(f"Voice memo berhasil diunduh ke: {dest_path}")
     except Exception as e:
-        logger.error(f"Gagal mengunduh audio: {e}")
+        logger.error(f"Gagal mengunduh voice memo: {e}")
         if msg:
             await msg.reply_text(f"❌ Gagal mengunduh pesan suara: {e}")
         return
 
-    prompt_text = (
-        f"[PENGGUNA MENGIRIMKAN REKAMAN SUARA / VOICE NOTE]\n"
-        f"Berkas audio tersimpan di: {dest_path}\n\n"
-        f"[CATATAN / CAPTION]:\n{caption if caption else 'Mohon dengarkan dan tindak lanjuti pesan suara ini.'}"
+    # Speech-to-Text (STT) transcription if enabled
+    transcript = None
+    if TELEGRAM_STT_ENABLED:
+        try:
+            transcript = await transcribe_audio_file(
+                dest_path,
+                model_name=TELEGRAM_WHISPER_MODEL
+            )
+        except Exception as e:
+            logger.warning(f"Gagal mentranskripsi pesan suara: {e}")
+
+    if transcript:
+        caption_line = f"\n[CATATAN PENGGUNA]: {caption}" if caption else ""
+        prompt_text = (
+            f"[PENGGUNA MENGIRIMKAN REKAMAN SUARA / VOICE NOTE (TRANSKRIPSI OTOMATIS)]:\n"
+            f"\"{transcript}\"{caption_line}\n\n"
+            f"(Berkas audio asli tersimpan di: {dest_path})"
+        )
+    else:
+        prompt_text = (
+            f"[PENGGUNA MENGIRIMKAN REKAMAN SUARA / VOICE NOTE]\n"
+            f"Berkas audio tersimpan di: {dest_path}\n\n"
+            f"[CATATAN / CAPTION]:\n{caption if caption else 'Mohon dengarkan dan tindak lanjuti pesan suara ini.'}"
+        )
+
+    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
+    await dispatch_fn(update, context, prompt_text)
+
+
+async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inbound Audio / Music track handler (distinct from voice notes, no STT)."""
+    if not is_authorized(update):
+        return
+    msg = update.message
+    if not msg or not msg.audio:
+        return
+
+    bot_id = getattr(context.bot, "id", None)
+    raw_username = getattr(context.bot, "username", "")
+    bot_username = raw_username if isinstance(raw_username, str) else ""
+    caption = (msg.caption or "").strip()
+    should_proc, _ = should_process_chat_message(
+        update,
+        bot_id=bot_id,
+        bot_username=bot_username,
+        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
+        text=caption
     )
+    if not should_proc:
+        return
+
+    user_id = update.effective_user.id
+    audio = msg.audio
+    orig_name = audio.file_name or f"audio_{int(time.time())}.mp3"
+
+    try:
+        file_obj = await audio.get_file()
+        ext = Path(orig_name).suffix or ".mp3"
+        filename = f"audio_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+        upload_dir = get_upload_dir()
+        dest_path = (upload_dir / filename).resolve()
+        await file_obj.download_to_drive(custom_path=dest_path)
+        logger.info(f"Berkas audio '{orig_name}' berhasil diunduh ke: {dest_path}")
+    except Exception as e:
+        logger.error(f"Gagal mengunduh audio: {e}")
+        if msg:
+            await msg.reply_text(f"❌ Gagal mengunduh berkas audio: {e}")
+        return
+
+    title_info = f"Judul: {audio.title}" if audio.title else ""
+    performer_info = f"Artis: {audio.performer}" if audio.performer else ""
+    meta_info = " | ".join(filter(None, [title_info, performer_info]))
+    meta_line = f"Metadata: {meta_info}\n" if meta_info else ""
+
+    prompt_text = (
+        f"[PENGGUNA MENGIRIMKAN BERKAS AUDIO / MUSIK]\n"
+        f"Nama berkas asli: {orig_name}\n"
+        f"{meta_line}"
+        f"Berkas tersimpan di: {dest_path}\n\n"
+        f"[CATATAN / CAPTION]:\n{caption if caption else 'Tolong periksa berkas audio ini.'}"
+    )
+
     dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
     await dispatch_fn(update, context, prompt_text)
 
@@ -1876,7 +2130,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # LIFECYCLE HOOKS & APPLICATION BUILDER
 # ==============================================================================
 async def post_init(application):
-    """Registers bot commands with Telegram API on startup."""
+    """Registers bot commands with Telegram API on startup and starts watchdog."""
     commands = [
         BotCommand("help", "📖 Buka Help Center interaktif"),
         BotCommand("model", "🤖 Pilih model AI aktif"),
@@ -1897,10 +2151,23 @@ async def post_init(application):
     except Exception as e:
         logger.warning(f"Gagal mendaftarkan bot commands: {e}")
 
+    # Start PollingStallWatchdog if running in polling mode
+    if not TELEGRAM_WEBHOOK_URL:
+        try:
+            stall_watchdog.start(application)
+            logger.info("✓ Polling stall watchdog aktif.")
+        except Exception as e:
+            logger.warning(f"Gagal memulai stall watchdog: {e}")
+
 
 async def post_shutdown(application):
-    """Cleans up running subprocesses and state on shutdown."""
+    """Cleans up running subprocesses, watchdog, and instance lock on shutdown."""
     logger.info("Menutup seluruh subprocess Antigravity...")
+    try:
+        await stall_watchdog.stop()
+    except Exception:
+        pass
+
     try:
         await text_debouncer.cancel_all()
         await media_group_collector.cancel_all()
@@ -1916,6 +2183,11 @@ async def post_shutdown(application):
     user_processes.clear()
     user_conversations.clear()
 
+    try:
+        release_instance_lock()
+    except Exception:
+        pass
+
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
@@ -1925,54 +2197,76 @@ def main():
     if not ALLOWED_USER_IDS:
         logger.warning("⚠️ ALLOWED_USER_ID belum diatur. Tidak ada pengguna yang dapat mengakses bot!")
 
+    # Instance lock guard (Anti-409 Conflict)
+    if not acquire_instance_lock():
+        logger.critical("❌ Proses bot lain sedang berjalan dengan instance lock aktif! Menghentikan proses ini untuk mencegah 409 Conflict.")
+        sys.exit(1)
+
     logger.info(f"🤖 Antigravity Engine : Subprocess agy CLI (Hermes-Parity)")
     logger.info(f"📂 Binary Path        : {AGY_BIN_PATH}")
     logger.info(f"🛡️ Whitelist User IDs : {ALLOWED_USER_IDS}")
     logger.info(f"⚙️ Approval Mode      : {APPROVAL_MODE} (Timeout: {APPROVAL_TIMEOUT_SECONDS}s)")
     logger.info(f"📁 Workspace Path     : {WORKSPACE_DIR}")
 
-    request_client = build_resilient_request(
-        proxy_url=TELEGRAM_PROXY if TELEGRAM_PROXY else None,
-        enable_fallback=TELEGRAM_FALLBACK_TRANSPORT
-    )
+    try:
+        request_client = build_resilient_request(
+            proxy_url=TELEGRAM_PROXY if TELEGRAM_PROXY else None,
+            enable_fallback=TELEGRAM_FALLBACK_TRANSPORT
+        )
 
-    app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request_client)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
+        app = (
+            ApplicationBuilder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .request(request_client)
+            .post_init(post_init)
+            .post_shutdown(post_shutdown)
+            .build()
+        )
 
-    # Command Handlers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("model", handle_model_command))
-    app.add_handler(CommandHandler("topic", handle_topic_command))
-    app.add_handler(CommandHandler("topics", handle_topics_command))
-    app.add_handler(CommandHandler("title", handle_title_command))
-    app.add_handler(CommandHandler(["deletetopic", "rmtopic"], handle_delete_topic_command))
-    app.add_handler(CommandHandler("sessions", sessions_command))
-    app.add_handler(CommandHandler("resume", resume_command))
-    app.add_handler(CommandHandler(["usage", "limit"], usage_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler(["reset", "new", "clear"], reset_command))
-    app.add_handler(CommandHandler("cancel", cancel_command))
+        # Command Handlers
+        app.add_handler(CommandHandler("start", start_command))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("model", handle_model_command))
+        app.add_handler(CommandHandler("topic", handle_topic_command))
+        app.add_handler(CommandHandler("topics", handle_topics_command))
+        app.add_handler(CommandHandler("title", handle_title_command))
+        app.add_handler(CommandHandler(["deletetopic", "rmtopic"], handle_delete_topic_command))
+        app.add_handler(CommandHandler("sessions", sessions_command))
+        app.add_handler(CommandHandler("resume", resume_command))
+        app.add_handler(CommandHandler(["usage", "limit"], usage_command))
+        app.add_handler(CommandHandler("status", status_command))
+        app.add_handler(CommandHandler(["reset", "new", "clear"], reset_command))
+        app.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Callback Query Handlers (Approval & Model selection)
-    app.add_handler(CallbackQueryHandler(handle_callback_query))
+        # Callback Query Handlers (Approval, Model selection, Clarify, Slash Confirm)
+        app.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Media Handlers
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_message))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
+        # Media Handlers
+        app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+        app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+        app.add_handler(MessageHandler(filters.AUDIO, handle_audio_message))
+        app.add_handler(MessageHandler(filters.Document.ALL, handle_document_message))
 
-    # Text Messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        # Text Messages
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("🚀 Antigravity CLI Telegram Bot siap berjalan...")
-    app.run_polling()
+        if TELEGRAM_WEBHOOK_URL:
+            if not TELEGRAM_WEBHOOK_SECRET:
+                logger.critical("❌ TELEGRAM_WEBHOOK_URL diatur tetapi TELEGRAM_WEBHOOK_SECRET kosong! (GHSA-3vpc-7q5r-276h security policy). Startup dibatalkan.")
+                release_instance_lock()
+                sys.exit(1)
+            logger.info(f"🌐 Menjalankan mode Webhook di {TELEGRAM_WEBHOOK_LISTEN}:{TELEGRAM_WEBHOOK_PORT} -> {TELEGRAM_WEBHOOK_URL}")
+            app.run_webhook(
+                listen=TELEGRAM_WEBHOOK_LISTEN,
+                port=TELEGRAM_WEBHOOK_PORT,
+                webhook_url=TELEGRAM_WEBHOOK_URL,
+                secret_token=TELEGRAM_WEBHOOK_SECRET,
+            )
+        else:
+            logger.info("🚀 Antigravity CLI Telegram Bot siap berjalan dalam mode Long Polling...")
+            app.run_polling()
+    finally:
+        release_instance_lock()
 
 
 if __name__ == "__main__":

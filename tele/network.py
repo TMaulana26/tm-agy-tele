@@ -7,11 +7,16 @@ Adapted from hermes-agent/plugins/platforms/telegram/telegram_network.py.
 
 from __future__ import annotations
 
+import os
+import sys
+import re
+import time
 import asyncio
 import ipaddress
 import logging
 import socket
-from typing import Iterable, Optional, List, Dict, Any
+from pathlib import Path
+from typing import Iterable, Optional, List, Dict, Any, Callable, Coroutine
 
 import httpx
 from telegram.request import HTTPXRequest
@@ -199,3 +204,201 @@ def build_resilient_request(
         proxy=proxy_url if proxy_url else None,
         httpx_kwargs=httpx_kwargs if httpx_kwargs else None
     )
+
+
+# ==============================================================================
+# TOKEN & CREDENTIAL ERROR REDACTION (ALA HERMES)
+# ==============================================================================
+_TOKEN_PATTERN = re.compile(
+    r"\b[0-9]{8,12}:[A-Za-z0-9_-]{30,50}\b"
+)
+
+
+def redact_telegram_error_text(error: Any) -> str:
+    """
+    Redacts sensitive bot tokens and API URLs from exceptions and log strings.
+    Prevents token leakage into logs, terminal streams, or persistent status files.
+    """
+    if error is None:
+        return ""
+    text = str(error)
+    if not text:
+        return f"<{type(error).__name__}>"
+    return re.sub(
+        r"(bot)?[0-9]{8,12}:[A-Za-z0-9_-]{20,50}",
+        lambda m: f"{m.group(1) or ''}[REDACTED_BOT_TOKEN]",
+        text,
+        flags=re.IGNORECASE
+    )
+
+
+# ==============================================================================
+# SINGLE-INSTANCE PROCESS LOCK (ANTI-COLLISION / CONFLICT 409 GUARD)
+# ==============================================================================
+_LOCK_FILE: Optional[Path] = None
+INSTANCE_LOCK_FILE: Optional[Path] = None
+
+
+def acquire_instance_lock(lock_dir: Optional[Path] = None) -> bool:
+    """
+    Acquires single-instance lock file to prevent duplicate bot processes with the same token.
+    Returns True if lock acquired, False if another active process holds the lock.
+    """
+    global _LOCK_FILE, INSTANCE_LOCK_FILE
+    if INSTANCE_LOCK_FILE is not None:
+        lock_file = Path(INSTANCE_LOCK_FILE)
+    else:
+        try:
+            from config import get_data_dir
+            target_dir = lock_dir or get_data_dir()
+        except Exception:
+            target_dir = Path.cwd() / ".telegram_state"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = target_dir / "bot.lock"
+    _LOCK_FILE = lock_file
+
+    if _LOCK_FILE.exists():
+        try:
+            old_pid = int(_LOCK_FILE.read_text(encoding="utf-8").strip())
+            if _is_pid_alive(old_pid):
+                logger.error(f"Another instance of antigravity-tele-bot is already running (PID {old_pid}).")
+                return False
+        except (ValueError, OSError):
+            pass
+
+    try:
+        _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        return True
+    except OSError as e:
+        logger.error(f"Could not write instance lock file: {e}")
+        return False
+
+
+def release_instance_lock() -> None:
+    """Releases the instance lock file on clean shutdown."""
+    global _LOCK_FILE, INSTANCE_LOCK_FILE
+    lock_file = INSTANCE_LOCK_FILE if INSTANCE_LOCK_FILE is not None else _LOCK_FILE
+    if lock_file and lock_file.exists():
+        try:
+            lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+    _LOCK_FILE = None
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Checks whether the given PID represents an active running process."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if h_proc:
+            kernel32.CloseHandle(h_proc)
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+# ==============================================================================
+# POLLING STALL WATCHDOG (ALA HERMES)
+# ==============================================================================
+class PollingStallWatchdog:
+    """
+    Heartbeat and stall detector for Telegram Long Polling.
+    Monitors update progress and probes getWebhookInfo.pending_update_count.
+    Detects silent dead TCP/CLOSE-WAIT hangs and triggers soft recovery.
+    """
+
+    def __init__(
+        self,
+        stall_timeout: float = 120.0,
+        probe_interval: float = 20.0,
+        on_stall_callback: Optional[Callable[[], Coroutine[Any, Any, None]]] = None,
+        timeout_seconds: Optional[float] = None
+    ):
+        if timeout_seconds is not None:
+            stall_timeout = timeout_seconds
+        self.stall_timeout = max(5.0, float(stall_timeout))
+        self.probe_interval = max(1.0, float(probe_interval))
+        self.on_stall_callback = on_stall_callback
+        self.last_progress_monotonic = time.monotonic()
+        self._task: Optional[asyncio.Task] = None
+        self._stopped = False
+        self._pending_stuck_count = 0
+
+    def record_progress(self) -> None:
+        """Called whenever an update is successfully admitted or processed."""
+        self.last_progress_monotonic = time.monotonic()
+        self._pending_stuck_count = 0
+
+    def notify_progress(self) -> None:
+        """Alias for record_progress."""
+        self.record_progress()
+
+    async def _loop(self, app: Any) -> None:
+        logger.info("Telegram Polling Stall Watchdog started.")
+        while not self._stopped:
+            try:
+                await asyncio.sleep(self.probe_interval)
+                if self._stopped:
+                    break
+
+                now = time.monotonic()
+                updater = getattr(app, "updater", None)
+                if updater is None or not getattr(updater, "running", False):
+                    continue
+
+                bot = getattr(app, "bot", None)
+                if bot and hasattr(bot, "get_webhook_info"):
+                    try:
+                        info = await asyncio.wait_for(bot.get_webhook_info(), timeout=8.0)
+                        pending = getattr(info, "pending_update_count", 0)
+                        if pending > 0:
+                            if now - self.last_progress_monotonic > self.stall_timeout:
+                                self._pending_stuck_count += 1
+                                logger.warning(
+                                    f"Polling stall detected: {pending} pending updates queued but no local progress for "
+                                    f"{now - self.last_progress_monotonic:.1f}s (probe {self._pending_stuck_count}/2)"
+                                )
+                                if self._pending_stuck_count >= 2:
+                                    logger.error("Polling stalled with queued updates! Triggering recovery.")
+                                    self._pending_stuck_count = 0
+                                    if self.on_stall_callback:
+                                        await self.on_stall_callback()
+                        else:
+                            self._pending_stuck_count = 0
+                    except Exception as e:
+                        logger.debug(f"Watchdog probe exception: {redact_telegram_error_text(e)}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in PollingStallWatchdog loop: {redact_telegram_error_text(e)}")
+
+    def start(self, app: Any) -> None:
+        if self._task and not self._task.done():
+            return
+        self._stopped = False
+        self.last_progress_monotonic = time.monotonic()
+        self._task = asyncio.create_task(self._loop(app))
+
+    async def stop(self) -> None:
+        self._stopped = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._task = None
