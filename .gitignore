@@ -48,3 +48,6 @@ Thumbs.db
 .telegram_state/
 *.db
 
+# Local Agent Planning Blueprint
+/.TODO
+.TODO
