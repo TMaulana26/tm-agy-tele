@@ -4,6 +4,16 @@
 **Auditor:** Antigravity AI Security & Systems Lead  
 **Status Evaluasi:** **BERSIH / HIGH RESILIENCE (Skor: 9.4 / 10)**
 
+> [!WARNING]
+> **Koreksi 8 Oktober 2026 — laporan ini kedaluwarsa dan sebagian klaimnya tidak akurat.**
+> Audit ulang menemukan bahwa saat laporan ini ditulis:
+> - Otorisasi **tidak** airtight: `/topic`, `/topics`, `/title`, `/deletetopic`, `/model`, dan seluruh callback tombol tidak memeriksa whitelist. `/topic --path=` dapat membuat direktori di mana saja oleh pengguna asing.
+> - Anti-replay admission (`tele/admission.py`) tidak pernah dipasang ke dispatcher, sehingga watchdog polling juga tidak pernah menerima sinyal progres.
+> - Blocklist & approval hanya memeriksa teks prompt pengguna, bukan aksi agent yang berjalan dengan `--dangerously-skip-permissions`.
+> - Media guard berbasis denylist belum mencakup `*.pem`, `*.key`, `.npmrc`, service account JSON, dll.
+>
+> Semua poin di atas sudah diperbaiki (ingress gate `bot.py:ingress_gate`, `TOPIC_WORKSPACE_ROOTS`, denylist diperluas). Batas perlindungan yang tersisa didokumentasikan di README bagian *Arsitektur Keamanan*. Perlakukan isi di bawah ini sebagai arsip historis.
+
 ---
 
 ## 1. Executive Summary & Status Backdoor

@@ -13,7 +13,7 @@ import re
 import time
 import logging
 from pathlib import Path
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Union
 from telegram import Bot, Message
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -50,6 +50,15 @@ FORBIDDEN_FILE_PATTERNS = [
     r"[\\/]\.profile$",
     r"[\\/]\.config[\\/]",
     r"[\\/]\.git[\\/]",
+    r"[\\/]\.kube[\\/]",
+    r"[\\/]\.docker[\\/]",
+    r"[\\/]\.telegram_state[\\/]",
+    r"[\\/]id_(?:dsa|ecdsa|ed25519)(?:\.pub)?$",
+    r"\.(?:pem|key|p12|pfx|jks|keystore|ppk|kdbx|sqlite|sqlite3)$",
+    r"[\\/]\.(?:npmrc|netrc|pypirc|pgpass|htpasswd|git-credentials)$",
+    r"[\\/]auth\.json$",
+    r"[\\/]secrets?\.(?:json|ya?ml|toml|ini)$",
+    r"service[-_]?account[^\\/]*\.json$",
 ]
 
 
@@ -257,14 +266,16 @@ async def send_outbound_media(
     file_path: str,
     caption: Optional[str] = None,
     reply_to_message_id: Optional[int] = None,
-    message_thread_id: Optional[int] = None
+    message_thread_id: Optional[int] = None,
+    workspace_dir: Optional[str] = None
 ) -> Optional[Message]:
     """
     Dispatches media to Telegram using the appropriate native API method
     (send_voice, send_photo, send_video, send_animation, or send_document).
     Supports safe retry on forum thread reply targets and caption parse errors.
+    workspace_dir must be the workspace of the turn (a topic may override WORKSPACE_DIR).
     """
-    is_valid, err_reason = validate_media_delivery_path(file_path)
+    is_valid, err_reason = validate_media_delivery_path(file_path, workspace_dir or WORKSPACE_DIR)
     if not is_valid:
         logger.error(f"Cannot send media '{file_path}': {err_reason}")
         return None

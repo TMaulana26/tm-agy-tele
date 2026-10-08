@@ -51,3 +51,8 @@ Thumbs.db
 # Local Agent Planning Blueprint
 /.TODO
 .TODO
+
+/.swarm/
+
+# Docker workspace mount (default HOST_WORKSPACE_DIR)
+/workspace/

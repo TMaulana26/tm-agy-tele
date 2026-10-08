@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tele.media import (
     validate_media_delivery_path,
@@ -71,11 +72,44 @@ class TestMediaGuard(unittest.TestCase):
             self.ws / ".bashrc",
             self.ws / ".config" / "token.json",
             self.ws / ".git" / "config",
+            self.ws / "server.pem",
+            self.ws / "tls.key",
+            self.ws / "id_ed25519",
+            self.ws / ".npmrc",
+            self.ws / "service-account-prod.json",
+            self.ws / "secrets.yaml",
+            self.ws / "app.sqlite",
         ]
         for s in secret_candidates:
             s.write_text("secret")
             is_valid, reason = validate_media_delivery_path(str(s), workspace_dir=str(self.ws))
             self.assertFalse(is_valid, f"Expected {s.name} to be blocked as sensitive file!")
+
+    def test_send_outbound_media_respects_topic_workspace(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from tele.media import send_outbound_media
+
+        report = self.ws / "report.md"
+        report.write_text("# Report")
+        mock_bot = MagicMock()
+        mock_bot.send_document = AsyncMock(return_value=MagicMock(message_id=1))
+
+        # Point TEMP elsewhere so only the workspace boundary can allow this file
+        elsewhere = self.ws / "elsewhere"
+        elsewhere.mkdir()
+        with patch.dict(os.environ, {"TEMP": str(elsewhere)}):
+            # Validated against the default WORKSPACE_DIR the file is out of bounds...
+            rejected = asyncio.run(send_outbound_media(bot=mock_bot, chat_id=1, file_path=str(report)))
+            self.assertIsNone(rejected)
+            mock_bot.send_document.assert_not_called()
+
+            # ...but the turn's topic workspace allows it
+            result = asyncio.run(send_outbound_media(
+                bot=mock_bot, chat_id=1, file_path=str(report), workspace_dir=str(self.ws)
+            ))
+        self.assertIsNotNone(result)
+        mock_bot.send_document.assert_called_once()
 
     def test_classify_media_type(self):
         self.assertEqual(classify_media_type("audio.ogg"), "voice")

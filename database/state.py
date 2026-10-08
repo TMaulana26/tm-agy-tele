@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 SQLite State storage for Antigravity Telegram Bot.
-Handles DM topic bindings, user model preferences, and anti-replay update receipts.
+Handles DM topic bindings, root chat conversations, user model preferences,
+and anti-replay update receipts.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from contextlib import contextmanager
 
 logger = logging.getLogger("antigravity-tele-bot.database")
 
-_DEFAULT_DB_FILE = get_data_dir() / "state.db"
+_DEFAULT_DB_FILE = Path(os.getenv("STATE_DB_PATH", "").strip() or get_data_dir() / "state.db")
 
 
 class StateDatabase:
@@ -77,7 +78,19 @@ class StateDatabase:
 
                 CREATE INDEX IF NOT EXISTS idx_update_receipts_created_at
                 ON telegram_update_receipts(created_at);
+
+                CREATE TABLE IF NOT EXISTS root_conversations (
+                    user_id TEXT NOT NULL PRIMARY KEY,
+                    conv_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
             """)
+
+            # WAL lets readers proceed while a write is in progress
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+            except sqlite3.OperationalError:
+                pass
 
             # Dynamic column migration for existing databases
             for col, col_type in [
@@ -169,6 +182,32 @@ class StateDatabase:
                 (str(chat_id),)
             )
             return [dict(r) for r in cur.fetchall()]
+
+    # --------------------------------------------------------------------------
+    # ROOT CHAT CONVERSATIONS (non-topic sessions survive restarts)
+    # --------------------------------------------------------------------------
+    def get_root_conversation(self, user_id: Any) -> Optional[str]:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT conv_id FROM root_conversations WHERE user_id = ?",
+                (str(user_id),)
+            )
+            row = cur.fetchone()
+            return str(row["conv_id"]) if row and row["conv_id"] else None
+
+    def set_root_conversation(self, user_id: Any, conv_id: str) -> None:
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO root_conversations (user_id, conv_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    conv_id = excluded.conv_id,
+                    updated_at = excluded.updated_at
+            """, (str(user_id), conv_id, time.time()))
+
+    def delete_root_conversation(self, user_id: Any) -> None:
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM root_conversations WHERE user_id = ?", (str(user_id),))
 
     # --------------------------------------------------------------------------
     # MODEL PREFERENCES

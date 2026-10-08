@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
 Antigravity Telegram Bot (Native agy CLI Subprocess Engine).
-Features full parity with Hermes Agent in Telegram:
-1. Bot API 9.5 Draft Streaming (sendMessageDraft) & In-place status updates.
+Features parity with Hermes Agent in Telegram:
+1. Ingress gate: whitelist authorization + anti-replay admission for every update.
 2. Bot API 9.4 Private Chat Topics (/topic) for multi-session parallel DMs.
-3. Silent Turn Pinned Indicator & Real Reactions (👀 -> 👍/👎).
+3. Turn lifecycle reactions (👀 -> 👍/👎), quiet pinning, and in-place status bubble.
 4. Interactive Model Picker (/model) using official agy models.
 5. Multi-Media Pipeline with Voice Bubble audio & strict Media Path Traversal Guard.
 6. DNS-over-HTTPS (DoH) & Host/SNI preserving fallback transport.
-7. Anti-replay update admission control.
-8. Interactive Inline Approval (Hermes Guard) & /cancel PID killing.
+7. Polling stall watchdog with automatic polling restart.
+8. Interactive Inline Approval (Hermes Guard) & /cancel process-tree killing.
+9. Follow-up message queue while a turn is running.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from __future__ import annotations
 import os
 import sys
 import re
-import json
 import time
 import html
 import uuid
@@ -25,7 +25,7 @@ import shutil
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Set, Optional, Tuple, List, Any
+from typing import Dict, Optional, Tuple, List, Any
 
 from telegram import (
     Update,
@@ -38,15 +38,16 @@ from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
+    ApplicationHandlerStop,
     ContextTypes,
     MessageHandler,
     CommandHandler,
     CallbackQueryHandler,
+    TypeHandler,
     filters,
 )
 
 # Central Configuration
-import config
 from config import (
     TELEGRAM_BOT_TOKEN,
     ALLOWED_USER_IDS,
@@ -67,59 +68,47 @@ from config import (
     TELEGRAM_WEBHOOK_PORT,
     TELEGRAM_WEBHOOK_LISTEN,
     TELEGRAM_POLLING_STALL_TIMEOUT,
-    TELEGRAM_IMAGE_PRECOMPRESS,
     TELEGRAM_STT_ENABLED,
     TELEGRAM_WHISPER_MODEL,
     resolve_workspace_dir,
-    get_data_dir,
     build_cli_prompt,
 )
 
+
 def get_upload_dir() -> Path:
     """Memastikan dan mengembalikan direktori penyimpanan berkas unggahan Telegram (.telegram_uploads)."""
-    current_ws = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
-    upload_dir = Path(current_ws) / ".telegram_uploads"
+    upload_dir = Path(WORKSPACE_DIR) / ".telegram_uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     return upload_dir
 
 
 # Database State
-from database.state import get_db, StateDatabase
+from database.state import get_db
 
 # Telegram Platform Components
 from tele.network import (
     build_resilient_request,
-    TelegramFallbackTransport,
     redact_telegram_error_text,
     acquire_instance_lock,
     release_instance_lock,
     PollingStallWatchdog,
 )
-from tele.admission import check_update_admission, is_update_admitted, set_progress_listener
+from tele.admission import check_update_admission, notify_progress, set_progress_listener
 from tele.entities import expand_link_entities, clean_bot_mentions, format_reply_context
 from tele.clarify import (
     detect_clarify_options,
     build_clarify_keyboard,
-    build_slash_confirm_keyboard,
     register_clarification,
+    get_clarification,
     pop_clarification,
-    register_slash_confirm,
-    pop_slash_confirm,
 )
 from tele.stt import transcribe_audio_file
 from tele.media import (
     validate_media_delivery_path,
     extract_media_paths,
     send_outbound_media,
-    classify_media_type,
 )
-from tele.streaming import (
-    supports_draft_streaming,
-    send_draft_stream,
-    send_or_update_status,
-    clear_status_bubble,
-    split_message,
-)
+from tele.streaming import split_message
 from tele.formatters import markdown_to_telegram_html, append_duration_badge, strip_html_for_plain_text
 from tele.topics import (
     handle_topic_command,
@@ -134,10 +123,19 @@ from tele.picker import handle_model_command, handle_model_callback, send_model_
 from tele.gating import should_process_chat_message
 from tele.coalescing import TextDebouncer, MediaGroupCollector
 
-# Core Engine & Approval
+# Core Engine & Approval (some names are re-exported for tests and back-compat)
+from core.agy_engine import (
+    user_conversations,
+    user_processes,
+    user_locks,
+    user_tasks,
+    get_user_lock,
+    list_brain_bases,
+    recover_last_response_from_transcript,
+    run_agy_cli,
+    terminate_process_tree,
+)
 from core.approval import (
-    HARDLINE_BLOCKLIST,
-    DESTRUCTIVE_PATTERNS,
     is_hardline_blocked,
     is_destructive_prompt,
     pending_approvals,
@@ -147,7 +145,7 @@ from core.approval import (
 from core.usage import (
     format_progress_bar,
     format_relative_time,
-    format_usage_data,
+    format_usage_data,  # re-exported for tests
     fetch_agy_usage_report,
     is_quota_inquiry,
 )
@@ -158,18 +156,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("antigravity-tele-bot")
 
-# Global registries for state and cancellation
-user_conversations: Dict[int, str] = {}
-user_processes: Dict[int, asyncio.subprocess.Process] = {}
-user_locks: Dict[int, asyncio.Lock] = {}
-user_tasks: Dict[int, asyncio.Task] = {}
-
-
-def get_user_lock(user_id: int) -> asyncio.Lock:
-    """Returns mutex lock per user to prevent concurrent race conditions."""
-    if user_id not in user_locks:
-        user_locks[user_id] = asyncio.Lock()
-    return user_locks[user_id]
+# Follow-up prompts received while a turn is running: user_id -> [(update, context, prompt)]
+MAX_QUEUED_PROMPTS = 5
+user_pending_prompts: Dict[int, List[Tuple[Update, ContextTypes.DEFAULT_TYPE, str]]] = {}
 
 
 def is_user_busy(user_id: int) -> bool:
@@ -185,8 +174,7 @@ def is_user_busy(user_id: int) -> bool:
 
 async def _coalesced_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
     """Dispatches coalesced/debounced prompts into agent turn execution."""
-    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    await dispatch_fn(update, context, prompt)
+    await _dispatch_agent_turn(update, context, prompt)
 
 
 text_debouncer = TextDebouncer(
@@ -211,7 +199,7 @@ set_progress_listener(stall_watchdog.record_progress)
 
 
 # ==============================================================================
-# AUTHORIZATION & UTILITIES
+# AUTHORIZATION, INGRESS GATE & UTILITIES
 # ==============================================================================
 def is_authorized(update: Update) -> bool:
     """Verifies whether the sender is in ALLOWED_USER_IDS."""
@@ -219,6 +207,37 @@ def is_authorized(update: Update) -> bool:
     if user is None:
         return False
     return user.id in ALLOWED_USER_IDS
+
+
+def _is_start_command(update: Update) -> bool:
+    msg = update.message
+    text = msg.text if msg is not None and isinstance(getattr(msg, "text", None), str) else ""
+    if not text.strip():
+        return False
+    return text.split(maxsplit=1)[0].split("@", 1)[0].lower() == "/start"
+
+
+async def ingress_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Runs before every handler (group -1).
+    1. Rejects updates from users outside ALLOWED_USER_IDS (only /start is let through so a
+       stranger can learn their Telegram ID), covering commands, media and button callbacks.
+    2. Drops redelivered updates via persistent anti-replay receipts.
+    """
+    notify_progress()
+
+    if not (is_authorized(update) or _is_start_command(update)):
+        user = update.effective_user
+        logger.warning(f"Update ditolak dari pengguna di luar whitelist: {user.id if user else 'Unknown'}")
+        if update.callback_query is not None:
+            try:
+                await update.callback_query.answer("⛔ Akses ditolak.", show_alert=True)
+            except Exception:
+                pass
+        raise ApplicationHandlerStop
+
+    if not check_update_admission(update, context):
+        raise ApplicationHandlerStop
 
 
 def get_effective_thread_id(update: Update) -> Optional[int]:
@@ -229,6 +248,37 @@ def get_effective_thread_id(update: Update) -> Optional[int]:
         if isinstance(tid, int):
             return tid
     return None
+
+
+def get_root_conversation(user_id: int) -> Optional[str]:
+    """Returns the user's root-chat (non-topic) conversation id, restoring it from SQLite after a restart."""
+    conv = user_conversations.get(user_id)
+    if conv:
+        return conv
+    try:
+        conv = get_db().get_root_conversation(user_id)
+    except Exception as e:
+        logger.debug(f"Could not load root conversation for {user_id}: {e}")
+        return None
+    if conv:
+        user_conversations[user_id] = conv
+    return conv
+
+
+def set_root_conversation(user_id: int, conv_id: Optional[str]) -> None:
+    """Stores (or clears when conv_id is falsy) the user's root-chat conversation id."""
+    if conv_id:
+        user_conversations[user_id] = conv_id
+    else:
+        user_conversations.pop(user_id, None)
+    try:
+        db = get_db()
+        if conv_id:
+            db.set_root_conversation(user_id, conv_id)
+        else:
+            db.delete_root_conversation(user_id)
+    except Exception as e:
+        logger.warning(f"Gagal menyimpan sesi root untuk user {user_id}: {e}")
 
 
 async def safe_send_message(
@@ -441,388 +491,6 @@ async def on_turn_complete(
 
 
 # ==============================================================================
-# SUBPROCESS ENGINE & TRANSCRIPT RECOVERY
-# ==============================================================================
-def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
-    """
-    Searches for transcript.jsonl for a given conversation ID or the newest session.
-    Reads WORKSPACE_DIR dynamically to respect runtime test patching.
-    """
-    current_workspace = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
-    candidate_bases: List[Path] = []
-    home = Path.home()
-    candidate_bases.extend([
-        home / ".gemini" / "antigravity-cli" / "brain",
-        home / ".gemini" / "antigravity" / "brain",
-        home / ".gemini" / "brain",
-        Path("/home/ubuntu/.gemini/antigravity-cli/brain"),
-        Path("/home/ubuntu/.gemini/antigravity/brain"),
-        Path("/home/ubuntu/.gemini/brain"),
-        Path("/root/.gemini/brain"),
-        Path(current_workspace) / ".gemini" / "brain",
-    ])
-
-    # Dynamic recursive scan under ~/.gemini for any brain folders
-    search_parents = [home / ".gemini", Path("/home/ubuntu/.gemini"), Path(current_workspace) / ".gemini"]
-    for sp in search_parents:
-        try:
-            if sp.is_dir():
-                for b_dir in sp.glob("**/brain"):
-                    try:
-                        if b_dir.is_dir() and b_dir not in candidate_bases:
-                            candidate_bases.append(b_dir)
-                    except (PermissionError, OSError):
-                        pass
-        except (PermissionError, OSError):
-            pass
-
-    valid_bases: List[Path] = []
-    for b in candidate_bases:
-        try:
-            if b.is_dir():
-                valid_bases.append(b)
-        except (PermissionError, OSError):
-            continue
-
-    if conv_id:
-        for base in valid_bases:
-            try:
-                cand = base / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
-                if cand.is_file():
-                    return cand, conv_id
-            except (PermissionError, OSError):
-                continue
-        return None, conv_id
-
-    # Fallback to newest conversation folder: prioritize current workspace first
-    ws_brain = Path(current_workspace) / ".gemini" / "brain"
-    try:
-        if ws_brain.is_dir():
-            ws_newest_file = None
-            ws_newest_mtime = -1.0
-            ws_conv_id = None
-            for item in ws_brain.iterdir():
-                try:
-                    if item.is_dir():
-                        cand = item / ".system_generated" / "logs" / "transcript.jsonl"
-                        if cand.is_file():
-                            mtime = cand.stat().st_mtime
-                            if mtime > ws_newest_mtime:
-                                ws_newest_mtime = mtime
-                                ws_newest_file = cand
-                                ws_conv_id = item.name
-                except (PermissionError, OSError):
-                    continue
-            if ws_newest_file and ws_conv_id:
-                return ws_newest_file, ws_conv_id
-    except (PermissionError, OSError):
-        pass
-    except Exception as e:
-        logger.debug(f"Error checking workspace brain dir {ws_brain}: {e}")
-
-    newest_file: Optional[Path] = None
-    newest_mtime = -1.0
-    found_conv_id: Optional[str] = None
-
-    for base in valid_bases:
-        try:
-            for item in base.iterdir():
-                if item.is_dir():
-                    cand = item / ".system_generated" / "logs" / "transcript.jsonl"
-                    if cand.is_file():
-                        mtime = cand.stat().st_mtime
-                        if mtime > newest_mtime:
-                            newest_mtime = mtime
-                            newest_file = cand
-                            found_conv_id = item.name
-        except Exception as e:
-            logger.debug(f"Error checking brain dir {base}: {e}")
-
-    if newest_file and found_conv_id:
-        return newest_file, found_conv_id
-
-    return None, None
-
-
-def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Recovers the model's last response from transcript.jsonl if subprocess timed out.
-    Enforces anti-stale turn protection (checks USER_INPUT before PLANNER_RESPONSE).
-    """
-    transcript_path, resolved_conv_id = get_transcript_path(conv_id)
-    if not transcript_path or not transcript_path.is_file():
-        return None, resolved_conv_id
-
-    try:
-        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
-            lines = [line.strip() for line in f if line.strip()]
-
-        last_planner_content = None
-        user_input_seen_after_planner = False
-
-        for line in reversed(lines):
-            try:
-                entry = json.loads(line)
-            except Exception:
-                continue
-
-            entry_type = entry.get("type", "")
-            if entry_type == "USER_INPUT":
-                if last_planner_content is None:
-                    user_input_seen_after_planner = True
-                    break
-
-            if entry_type == "PLANNER_RESPONSE" and last_planner_content is None:
-                content = entry.get("content", "").strip()
-                truncated_fields = entry.get("truncated_fields", [])
-                if "content" in truncated_fields:
-                    full_transcript = transcript_path.parent / "transcript_full.jsonl"
-                    if full_transcript.is_file():
-                        try:
-                            step_idx = entry.get("step_index")
-                            with open(full_transcript, "r", encoding="utf-8", errors="replace") as f_full:
-                                for full_line in f_full:
-                                    if not full_line.strip():
-                                        continue
-                                    try:
-                                        full_entry = json.loads(full_line)
-                                        if (step_idx is not None and full_entry.get("step_index") == step_idx) or (
-                                            step_idx is None and full_entry.get("type") == "PLANNER_RESPONSE"
-                                        ):
-                                            full_content = full_entry.get("content", "").strip()
-                                            if full_content:
-                                                content = full_content
-                                                break
-                                    except Exception:
-                                        continue
-                        except Exception as e_full:
-                            logger.debug(f"Gagal membaca transcript_full.jsonl: {e_full}")
-
-                if content:
-                    last_planner_content = content
-
-        if user_input_seen_after_planner:
-            # Cegah mengambil PLANNER_RESPONSE lama dari giliran sebelumnya
-            last_planner_content = None
-
-        # Check if an artifact (.md) was generated in conv_dir if last_planner_content is empty
-        if not last_planner_content:
-            candidate_dirs = [
-                transcript_path.parent.parent.parent,
-                transcript_path.parent.parent,
-            ]
-            for c_dir in candidate_dirs:
-                if c_dir and c_dir.is_dir():
-                    artifacts = [
-                        f for f in c_dir.glob("*.md")
-                        if f.is_file() and not f.name.startswith(".")
-                    ]
-                    if artifacts:
-                        artifacts.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-                        try:
-                            art_text = artifacts[0].read_text(encoding="utf-8", errors="replace").strip()
-                            if art_text:
-                                logger.info(f"Berhasil me-recover artefak '{artifacts[0].name}' dari {c_dir}")
-                                last_planner_content = art_text
-                                break
-                        except Exception as e_art:
-                            logger.debug(f"Gagal membaca artefak {artifacts[0]}: {e_art}")
-
-        if last_planner_content:
-            logger.info(
-                f"Berhasil me-recover balasan model ({len(last_planner_content)} karakter) dari "
-                f"{transcript_path} (Conv: {resolved_conv_id})"
-            )
-            return last_planner_content, resolved_conv_id
-
-        return None, resolved_conv_id
-    except Exception as e:
-        logger.warning(f"Error reading transcript {transcript_path}: {e}")
-        return None, resolved_conv_id
-
-
-async def run_agy_cli(
-    user_id: int,
-    prompt: str,
-    conv_id: Optional[str] = None,
-    cwd: Optional[str] = None,
-    model: Optional[str] = None
-) -> Tuple[str, Optional[str]]:
-    """
-    Executes agy CLI as an asynchronous subprocess.
-    Extracts conversation_id and response body with timeout & transcript recovery.
-    Returns (response_text, new_or_existing_conv_id).
-    """
-    effective_cwd = cwd or globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
-
-    if not os.path.exists(AGY_BIN_PATH) and not shutil.which(AGY_BIN_PATH):
-        raise FileNotFoundError(
-            f"Binary agy tidak ditemukan di: '{AGY_BIN_PATH}'. "
-            f"Periksa variabel AGY_BIN_PATH di file .env."
-        )
-
-    cmd = [AGY_BIN_PATH]
-    if conv_id:
-        cmd.extend(["--conversation", conv_id])
-
-    active_model = model or DEFAULT_MODEL
-    if active_model:
-        cmd.extend(["--model", active_model])
-
-    full_prompt = build_cli_prompt(prompt)
-    cmd.extend([
-        "-p", full_prompt,
-        "--print-timeout", f"{AGY_TIMEOUT_SECONDS}s",
-    ])
-    if AGY_SKIP_PERMISSIONS:
-        cmd.append("--dangerously-skip-permissions")
-    cmd.extend(["--output-format", "json"])
-
-    env = os.environ.copy()
-    extra_paths = [
-        "/home/ubuntu/.gemini/antigravity-cli/bin",
-        "/home/ubuntu/.local/bin",
-        "/usr/local/bin"
-    ]
-    env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "")])
-
-    logger.info(
-        f"Menjalankan subprocess agy untuk user {user_id} "
-        f"(Conv: {conv_id or 'Baru'}, Timeout: {AGY_TIMEOUT_SECONDS}s)..."
-    )
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=effective_cwd,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    user_processes[user_id] = proc
-    stdout_bytes = b""
-    stderr_bytes = b""
-    timed_out = False
-
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=float(AGY_TIMEOUT_SECONDS + 10)
-        )
-    except asyncio.TimeoutError:
-        timed_out = True
-        logger.warning(
-            f"Proses agy untuk user {user_id} (PID: {proc.pid if hasattr(proc, 'pid') else 'unknown'}) "
-            f"melebihi batas waktu ({AGY_TIMEOUT_SECONDS}s). Menghentikan subprocess..."
-        )
-        try:
-            res = proc.terminate()
-            if asyncio.iscoroutine(res):
-                await res
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except Exception:
-            try:
-                k_res = proc.kill()
-                if asyncio.iscoroutine(k_res):
-                    await k_res
-            except Exception:
-                pass
-    finally:
-        user_processes.pop(user_id, None)
-
-    if timed_out:
-        # Check current module for mocked recover_last_response_from_transcript
-        recover_fn = getattr(sys.modules[__name__], "recover_last_response_from_transcript", recover_last_response_from_transcript)
-        recovered, found_id = recover_fn(conv_id)
-        eff_id = found_id or conv_id
-        if recovered:
-            return (
-                f"{recovered}\n\n"
-                f"⏱️ <i>(Catatan: Subprocess agy melebihi batas waktu {AGY_TIMEOUT_SECONDS} detik dan dihentikan, "
-                f"namun jawaban berhasil dipulihkan dari log transkrip sistem.)</i>",
-                eff_id
-            )
-        return (
-            f"⏱️ **Waktu eksekusi habis (Timeout {AGY_TIMEOUT_SECONDS} detik).**\n"
-            f"Subprocess Antigravity telah dihentikan secara aman demi kestabilan sistem.\n\n"
-            f"💡 *Jika tugas memerlukan waktu lebih lama, Anda dapat memperbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`.*",
-            eff_id
-        )
-
-    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
-    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-
-    parsed_json = None
-    if stdout_text:
-        for line in stdout_text.splitlines():
-            line_str = line.strip()
-            if line_str.startswith("{") and line_str.endswith("}"):
-                try:
-                    parsed_json = json.loads(line_str)
-                    break
-                except Exception:
-                    continue
-        if not parsed_json:
-            try:
-                parsed_json = json.loads(stdout_text)
-            except Exception:
-                pass
-
-    if parsed_json and isinstance(parsed_json, dict):
-        ret_conv = parsed_json.get("conversation_id") or conv_id
-        resp = parsed_json.get("response", "").strip()
-        status = parsed_json.get("status", "")
-        err = parsed_json.get("error", "").strip()
-        duration = parsed_json.get("duration_seconds")
-        num_turns = parsed_json.get("num_turns")
-
-        if status == "ERROR" and err:
-            return f"❌ **Error dari agy:**\n```text\n{err}\n```", ret_conv
-
-        if not resp:
-            # Fallback: Recover from transcript or artifacts if response was empty
-            recover_fn = getattr(sys.modules[__name__], "recover_last_response_from_transcript", recover_last_response_from_transcript)
-            recovered, found_id = recover_fn(ret_conv)
-            if recovered and recovered.strip():
-                resp = recovered.strip()
-                if found_id:
-                    ret_conv = found_id
-
-        if resp:
-            return resp, ret_conv
-        elif err:
-            return f"⚠️ **Output agy:**\n```text\n{err}\n```", ret_conv
-        else:
-            dur_str = f" ({duration:.1f}s)" if isinstance(duration, (int, float)) else ""
-            turns_str = f" ({num_turns} turns)" if isinstance(num_turns, int) and num_turns > 1 else ""
-            timeout_hint = ""
-            if isinstance(duration, (int, float)) and duration >= (AGY_TIMEOUT_SECONDS - 5):
-                timeout_hint = (
-                    f"\n\n⏱️ *Catatan:* Proses selesai di batas waktu `{AGY_TIMEOUT_SECONDS}s`. "
-                    f"Jika tugas membutuhkan analisis lebih panjang, perbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`."
-                )
-            return (
-                f"✅ **Tugas Selesai!** Antigravity telah menyelesaikan seluruh langkah eksekusi di latar belakang{dur_str}{turns_str}, namun tidak ada pesan balasan teks langsung.{timeout_hint}",
-                ret_conv
-            )
-
-    if stdout_text:
-        clean_stdout = stdout_text.strip()
-        if clean_stdout.startswith("{") and clean_stdout.endswith("}"):
-            try:
-                data = json.loads(clean_stdout)
-                if "conversation_id" in data or "status" in data:
-                    return "✅ **Tugas Selesai!** Antigravity telah menyelesaikan tugas sistem tanpa balasan teks.", conv_id
-            except Exception:
-                pass
-        return stdout_text, conv_id
-    elif stderr_text:
-        return f"⚠️ Output (stderr):\n```text\n{stderr_text}\n```", conv_id
-
-    return "(agy menyelesaikan tugas tanpa balasan output teks)", conv_id
-
-
-# ==============================================================================
 # COMMAND HANDLERS
 # ==============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -854,6 +522,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send_message(context.bot, update.effective_chat.id, welcome_text, parse_mode=ParseMode.MARKDOWN)
 
 
+def _help_nav_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
+            InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
+        ]
+    ])
+
+
 def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMarkup]:
     """Builds interactive Help Center views with categorized guidance and navigation buttons."""
     if category == "topics":
@@ -867,13 +544,7 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
             "• <code>/deletetopic</code> (alias: <code>/rmtopic</code>) — Hapus topik saat ini beserta riwayat binding-nya.\n\n"
             "💡 <i>Tiap topik memiliki memori percakapan independen tanpa mencemari topik lain!</i>"
         )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
-                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
-            ]
-        ])
-        return text, keyboard
+        return text, _help_nav_keyboard()
 
     if category == "sessions":
         text = (
@@ -882,32 +553,23 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
             "• <code>/sessions</code> — Tampilkan riwayat ID sesi percakapan terbaru.\n"
             "• <code>/resume &lt;id_sesi&gt;</code> — Lanjutkan kembali konteks percakapan lama.\n"
             "• <code>/reset</code> (alias: <code>/new</code>, <code>/clear</code>) — Hapus memori aktif & mulai sesi fresh.\n"
-            "• <code>/cancel</code> — Hentikan paksa proses CLI yang sedang berjalan (<code>SIGTERM</code>/<code>SIGKILL</code>).\n\n"
-            "💡 <i>Gunakan /reset bila model mulai keluar konteks atau ingin memulai tugas baru.</i>"
+            "• <code>/cancel</code> — Hentikan paksa proses CLI yang sedang berjalan (<code>SIGTERM</code>/<code>SIGKILL</code>) beserta antrean pesan.\n\n"
+            "💡 <i>Pesan yang dikirim saat tugas masih berjalan otomatis diantrikan dan diproses setelahnya.</i>"
         )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
-                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
-            ]
-        ])
-        return text, keyboard
+        return text, _help_nav_keyboard()
 
     if category == "security":
         text = (
             "🛡️ <b>Panduan Keamanan & Sandbox (Hermes Guard)</b>\n\n"
             "Bot dilengkapi pengaman berlapis untuk melindungi VPS & data Akang:\n\n"
+            "• <b>Whitelist</b>: Semua pesan, perintah, dan tombol dari akun di luar whitelist ditolak.\n"
             "• <b>Interactive Approval</b>: Instruksi berisiko (drop table, rm -rf, git force) wajib disetujui manual via tombol Approve / Deny (timeout 120 detik, fail-closed).\n"
             "• <b>Hardline Blocklist</b>: Perintah katastropik sistem (<code>rm -rf /</code>, <code>mkfs</code>, <code>dd</code>, <code>shutdown</code>) <b>DIBLOKIR TOTAL</b>.\n"
-            "• <b>Media Guard</b>: Pengiriman file sensitif (<code>.env</code>, <code>state.db</code>, <code>auth.json</code>, SSH keys) dilarang secara ketat."
+            "• <b>Media Guard</b>: Pengiriman file sensitif (<code>.env</code>, <code>state.db</code>, <code>auth.json</code>, SSH keys, <code>*.pem</code>) dilarang secara ketat.\n\n"
+            "⚠️ <i>Approval & blocklist memeriksa teks instruksi Anda, bukan setiap aksi agent. "
+            "Jangan meminta agent memproses dokumen dari sumber yang tidak dipercaya.</i>"
         )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
-                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
-            ]
-        ])
-        return text, keyboard
+        return text, _help_nav_keyboard()
 
     if category == "system":
         text = (
@@ -917,13 +579,7 @@ def get_help_menu_content(category: str = "main") -> Tuple[str, InlineKeyboardMa
             "• <code>/model</code> — Buka pemilih model interaktif (Gemini 3.8, Claude, dll).\n"
             "• <code>/cancel</code> — Hentikan eksekusi perintah yang sedang berjalan."
         )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("« Kembali ke Menu Bantuan", callback_data="help:main"),
-                InlineKeyboardButton("✖️ Tutup", callback_data="help:close")
-            ]
-        ])
-        return text, keyboard
+        return text, _help_nav_keyboard()
 
     # Default: "main"
     text = (
@@ -960,18 +616,24 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    chat_id = update.effective_chat.id
-    thread_id = get_effective_thread_id(update)
-
     text, reply_markup = get_help_menu_content("main")
     await safe_send_message(
         context.bot,
-        chat_id,
+        update.effective_chat.id,
         text,
         reply_markup=reply_markup,
         parse_mode=ParseMode.HTML,
-        message_thread_id=thread_id
+        message_thread_id=get_effective_thread_id(update)
     )
+
+
+def _usage_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="usage_refresh"),
+            InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
+        ]
+    ])
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -989,26 +651,25 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_thread_id=thread_id
     )
 
-    fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
-    usage_kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data="usage_refresh"),
-            InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
-        ]
-    ])
+    usage_kb = _usage_keyboard()
     try:
-        report_html = await fetch_fn()
-        if status_msg:
-            await safe_edit_message(status_msg, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
-        else:
-            await safe_send_message(context.bot, chat_id, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+        report_html = await fetch_agy_usage_report()
     except Exception as e:
         logger.error(f"Error handling /usage: {e}", exc_info=True)
-        err_msg = f"❌ Gagal mengambil data kuota:\n<code>{html.escape(str(e))}</code>"
-        if status_msg:
-            await safe_edit_message(status_msg, err_msg, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
-        else:
-            await safe_send_message(context.bot, chat_id, err_msg, reply_markup=usage_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+        report_html = f"❌ Gagal mengambil data kuota:\n<code>{html.escape(str(e))}</code>"
+
+    if status_msg:
+        await safe_edit_message(status_msg, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
+    else:
+        await safe_send_message(context.bot, chat_id, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+
+
+def _resolve_current_conversation(user_id: int, chat_id: int, thread_id: Optional[int]) -> Optional[str]:
+    """Topic conversation inside a thread, root conversation otherwise."""
+    if thread_id is not None:
+        binding = get_db().get_topic_binding(chat_id, thread_id)
+        return (binding or {}).get("conv_id") or None
+    return get_root_conversation(user_id)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1020,31 +681,26 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = get_effective_thread_id(update)
 
     db = get_db()
-    current_conv = None
-    if thread_id is not None:
-        topic_binding = db.get_topic_binding(chat_id, thread_id)
-        if topic_binding:
-            current_conv = topic_binding.get("conv_id")
-    if not current_conv:
-        current_conv = user_conversations.get(user_id)
-
+    current_conv = _resolve_current_conversation(user_id, chat_id, thread_id)
     selected_model = db.get_user_model(user_id, chat_id, thread_id or "root") or DEFAULT_MODEL
     running_proc = user_processes.get(user_id)
     is_proc_running = running_proc is not None and running_proc.returncode is None
     bin_exists = os.path.exists(AGY_BIN_PATH) or shutil.which(AGY_BIN_PATH) is not None
+    queued = len(user_pending_prompts.get(user_id, []))
 
     status_text = (
         "📊 **Status Sistem Antigravity Bot (CLI Engine)**\n\n"
         f"• **Engine**: `Native agy CLI Subprocess`\n"
         f"• **Model Aktif**: `{selected_model}`\n"
         f"• **Binary Path**: `{AGY_BIN_PATH}` ({'✅ Ditemukan' if bin_exists else '❌ Tidak Ditemukan!'})\n"
-        f"• **Workspace Path**: `{globals().get('WORKSPACE_DIR', WORKSPACE_DIR)}`\n"
+        f"• **Workspace Path**: `{WORKSPACE_DIR}`\n"
         f"• **Approval Mode**: `{APPROVAL_MODE}`\n"
         f"• **Approval Timeout**: `{APPROVAL_TIMEOUT_SECONDS} detik`\n"
         f"• **Execution Timeout**: `{AGY_TIMEOUT_SECONDS} detik`\n"
         f"• **Sesi Percakapan**: `{current_conv if current_conv else 'Belum ada (Fresh)'}`\n"
         f"• **Topik Thread**: `{'Thread ' + str(thread_id) if thread_id is not None else 'Root Chat'}`\n"
         f"• **Status Tugas Saat Ini**: `{'⏳ Sedang Berjalan (PID: ' + str(running_proc.pid) + ')' if is_proc_running else '💤 Idle'}`\n"
+        f"• **Antrean Pesan**: `{queued}`\n"
         f"• **Whitelist User ID**: `{user_id}` (Terverifikasi)\n"
         f"• **Pending Approvals**: `{len(pending_approvals)}`"
     )
@@ -1057,17 +713,31 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_send_message(context.bot, chat_id, status_text, reply_markup=status_kb, parse_mode=ParseMode.MARKDOWN, message_thread_id=thread_id)
 
 
+def _cancel_pending_approvals(user_id: int) -> List[dict]:
+    """Cancels the user's pending approval futures and returns their registry entries."""
+    cancelled = []
+    for info in list(pending_approvals.values()):
+        if info.get("user_id") != user_id:
+            continue
+        fut = info.get("future")
+        if fut and not fut.done():
+            fut.cancel()
+        cancelled.append(info)
+    return cancelled
+
+
 async def perform_reset_execution(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Executes actual session reset, PID cancellation, and memory purge."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     thread_id = get_effective_thread_id(update)
 
-    # 1. Hentikan proses yang sedang berjalan
+    # 1. Hentikan proses yang sedang berjalan beserta antreannya
+    user_pending_prompts.pop(user_id, None)
     proc = user_processes.get(user_id)
     if proc and proc.returncode is None:
         try:
-            proc.terminate()
+            terminate_process_tree(proc)
         except Exception:
             pass
 
@@ -1076,20 +746,17 @@ async def perform_reset_execution(update: Update, context: ContextTypes.DEFAULT_
         task.cancel()
 
     # 2. Reset memori
-    old_conv = user_conversations.pop(user_id, None)
     if thread_id is not None:
         db = get_db()
         binding = db.get_topic_binding(chat_id, thread_id)
-        if binding and binding.get("conv_id"):
-            old_conv = binding.get("conv_id")
+        old_conv = binding.get("conv_id") if binding else None
         db.set_topic_binding(chat_id, thread_id, conv_id="", topic_name="Umum / General")
+    else:
+        old_conv = get_root_conversation(user_id)
+        set_root_conversation(user_id, None)
 
     # 3. Batalkan approval tertunda
-    for req_id, info in list(pending_approvals.items()):
-        if info.get("user_id") == user_id:
-            fut = info.get("future")
-            if fut and not fut.done():
-                fut.cancel()
+    _cancel_pending_approvals(user_id)
 
     reset_kb = InlineKeyboardMarkup([
         [
@@ -1116,6 +783,18 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await perform_reset_execution(update, context)
 
 
+def _format_age(mtime: float) -> str:
+    """Formats an epoch timestamp as a short relative age, e.g. '5m lalu'."""
+    seconds = max(0, int(time.time() - mtime))
+    if seconds < 60:
+        return "baru saja"
+    if seconds < 3600:
+        return f"{seconds // 60}m lalu"
+    if seconds < 86400:
+        return f"{seconds // 3600}j lalu"
+    return f"{seconds // 86400}h lalu"
+
+
 async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lists recent conversation sessions on host and current active binding."""
     if not is_authorized(update):
@@ -1124,40 +803,20 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     thread_id = get_effective_thread_id(update)
-
-    db = get_db()
-    current_conv = None
-    if thread_id is not None:
-        binding = db.get_topic_binding(chat_id, thread_id)
-        if binding:
-            current_conv = binding.get("conv_id")
-    if not current_conv:
-        current_conv = user_conversations.get(user_id)
-
-    current_workspace = globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
-    home = Path.home()
-    candidate_bases = [
-        home / ".gemini" / "antigravity-cli" / "brain",
-        home / ".gemini" / "antigravity" / "brain",
-        Path("/home/ubuntu/.gemini/antigravity-cli/brain"),
-        Path("/home/ubuntu/.gemini/antigravity/brain"),
-        Path(current_workspace) / ".gemini" / "brain",
-    ]
-    valid_bases = [b for b in candidate_bases if b.is_dir()]
+    current_conv = _resolve_current_conversation(user_id, chat_id, thread_id)
 
     discovered = []
     seen_ids = set()
-    for base in valid_bases:
+    for base in list_brain_bases():
         try:
             for item in base.iterdir():
                 if item.is_dir() and item.name not in seen_ids:
                     t_path = item / ".system_generated" / "logs" / "transcript.jsonl"
                     if t_path.is_file():
-                        mtime = t_path.stat().st_mtime
-                        discovered.append((mtime, item.name, base))
+                        discovered.append((t_path.stat().st_mtime, item.name))
                         seen_ids.add(item.name)
-        except Exception:
-            pass
+        except (PermissionError, OSError):
+            continue
 
     discovered.sort(key=lambda x: x[0], reverse=True)
     recent = discovered[:8]
@@ -1173,10 +832,10 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = ["🗂️ <b>Daftar Sesi Percakapan Antigravity Terbaru:</b>\n"]
-    for idx, (mtime, cid, base) in enumerate(recent, 1):
-        rel_time = format_relative_time(mtime)
+    for idx, (mtime, cid) in enumerate(recent, 1):
+        rel_time = _format_age(mtime)
         is_active = " 👈 <i>(Aktif)</i>" if cid == current_conv else ""
-        lines.append(f"{idx}. <code>{cid}</code> ({rel_time}){is_active}")
+        lines.append(f"{idx}. <code>{html.escape(cid)}</code> ({rel_time}){is_active}")
 
     lines.append("\n💡 <i>Gunakan perintah:</i> <code>/resume &lt;id_sesi&gt;</code> <i>untuk berpindah ke sesi tersebut.</i>")
     await safe_send_message(context.bot, chat_id, "\n".join(lines), reply_markup=close_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
@@ -1207,16 +866,15 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    db = get_db()
     if thread_id is not None:
-        db.set_topic_binding(chat_id, thread_id, conv_id=target_id)
+        get_db().set_topic_binding(chat_id, thread_id, conv_id=target_id)
     else:
-        user_conversations[user_id] = target_id
+        set_root_conversation(user_id, target_id)
 
     await safe_send_message(
         context.bot,
         chat_id,
-        f"✓ <b>Berhasil beralih ke sesi:</b>\n<code>{target_id}</code>\n\n"
+        f"✓ <b>Berhasil beralih ke sesi:</b>\n<code>{html.escape(target_id)}</code>\n\n"
         "Instruksi berikutnya akan melanjutkan konteks dan riwayat dari sesi tersebut.",
         parse_mode=ParseMode.HTML,
         message_thread_id=thread_id
@@ -1230,15 +888,15 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     thread_id = get_effective_thread_id(update)
-    cancelled_anything = False
+    cancelled_anything = bool(user_pending_prompts.pop(user_id, None))
 
     proc = user_processes.get(user_id)
     if proc and proc.returncode is None:
         try:
-            proc.terminate()
+            terminate_process_tree(proc)
             await asyncio.sleep(0.5)
             if proc.returncode is None:
-                proc.kill()
+                terminate_process_tree(proc, force=True)
             cancelled_anything = True
             logger.info(f"Subprocess agy (PID: {proc.pid}) untuk user {user_id} dimatikan via /cancel.")
         except Exception as e:
@@ -1249,27 +907,23 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task.cancel()
         cancelled_anything = True
 
-    for req_id, info in list(pending_approvals.items()):
-        if info.get("user_id") == user_id:
-            fut = info.get("future")
-            if fut and not fut.done():
-                fut.cancel()
-            msg = info.get("message")
-            if msg:
-                try:
-                    await safe_edit_message(
-                        msg,
-                        f"{info.get('text', '')}\n\nStatus: 🛑 **DIBATALKAN VIA /cancel**"
-                    )
-                except Exception:
-                    pass
-            cancelled_anything = True
+    for info in _cancel_pending_approvals(user_id):
+        msg = info.get("message")
+        if msg:
+            try:
+                await safe_edit_message(
+                    msg,
+                    f"{info.get('text', '')}\n\nStatus: 🛑 **DIBATALKAN VIA /cancel**"
+                )
+            except Exception:
+                pass
+        cancelled_anything = True
 
     if cancelled_anything:
         await safe_send_message(
             context.bot,
             chat_id,
-            "🛑 **Tugas berhasil dibatalkan!** Subprocess `agy` dan eksekusi telah dihentikan.",
+            "🛑 **Tugas berhasil dibatalkan!** Subprocess `agy`, eksekusi, dan antrean pesan telah dihentikan.",
             parse_mode=ParseMode.MARKDOWN,
             message_thread_id=thread_id
         )
@@ -1283,10 +937,21 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ==============================================================================
+# CALLBACK QUERY HANDLERS
+# ==============================================================================
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Central callback router for approval confirmations, model selection, and help center."""
     query = update.callback_query
     if query is None or not query.data:
+        return
+
+    # Defense in depth: ingress_gate already rejects non-whitelisted clickers
+    if not is_authorized(update):
+        try:
+            await query.answer("⛔ Akses ditolak.", show_alert=True)
+        except Exception:
+            pass
         return
 
     data = query.data
@@ -1294,8 +959,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_approval_callback(update, context)
     elif data.startswith("cl:"):
         await handle_clarify_callback(update, context)
-    elif data.startswith("sc:"):
-        await handle_slash_confirm_callback(update, context)
     elif data.startswith("model_"):
         await handle_model_callback(update, context)
     elif data.startswith("help:"):
@@ -1311,16 +974,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
     elif data == "usage_refresh":
         await query.answer("Memperbarui data kuota...")
-        fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
         try:
-            report_html = await fetch_fn()
-            usage_kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🔄 Refresh", callback_data="usage_refresh"),
-                    InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
-                ]
-            ])
-            await safe_edit_message(query.message, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML)
+            report_html = await fetch_agy_usage_report()
+            await safe_edit_message(query.message, report_html, reply_markup=_usage_keyboard(), parse_mode=ParseMode.HTML)
         except Exception as e:
             await query.answer(f"Gagal refresh: {e}", show_alert=True)
 
@@ -1338,10 +994,8 @@ async def handle_clarify_callback(update: Update, context: ContextTypes.DEFAULT_
     clarify_id = parts[1]
     choice_idx = parts[2]
     user_id = update.effective_user.id
-    chat_id = query.message.chat_id if query.message else update.effective_chat.id
-    thread_id = get_effective_thread_id(update)
 
-    clarify_data = pop_clarification(clarify_id)
+    clarify_data = get_clarification(clarify_id)
     if not clarify_data:
         await query.answer("Pertanyaan ini sudah dijawab atau kedaluwarsa.", show_alert=True)
         try:
@@ -1349,6 +1003,13 @@ async def handle_clarify_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
         return
+
+    owner_id = clarify_data.get("user_id")
+    if owner_id is not None and owner_id != user_id:
+        await query.answer("⛔ Pilihan ini milik pengguna lain.", show_alert=True)
+        return
+
+    pop_clarification(clarify_id)
 
     if choice_idx == "other":
         await query.answer()
@@ -1363,7 +1024,7 @@ async def handle_clarify_callback(update: Update, context: ContextTypes.DEFAULT_
     try:
         idx = int(choice_idx)
         selected_text = clarify_data["choices"][idx]
-    except (ValueError, IndexError):
+    except (ValueError, IndexError, KeyError):
         selected_text = f"Pilihan #{choice_idx}"
 
     await query.answer(f"Memilih: {selected_text[:30]}")
@@ -1374,53 +1035,7 @@ async def handle_clarify_callback(update: Update, context: ContextTypes.DEFAULT_
         parse_mode=ParseMode.HTML
     )
 
-    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    await dispatch_fn(update, context, selected_text)
-
-
-async def handle_slash_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles confirmation for destructive slash commands (/reset, /cancel)."""
-    query = update.callback_query
-    if query is None or not query.data:
-        return
-
-    parts = query.data.split(":")
-    if len(parts) < 3:
-        return
-
-    confirm_id = parts[1]
-    action = parts[2]
-
-    confirm_data = pop_slash_confirm(confirm_id)
-    if not confirm_data:
-        await query.answer("Konfirmasi sudah kedaluwarsa.", show_alert=True)
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return
-
-    cmd = confirm_data.get("command", "")
-    if action == "approve":
-        await query.answer("Dikonfirmasi!")
-        await safe_edit_message(
-            query.message,
-            f"⏳ <i>Mengeksekusi {html.escape(cmd)}...</i>",
-            reply_markup=None,
-            parse_mode=ParseMode.HTML
-        )
-        if cmd == "/reset":
-            await perform_reset_execution(update, context)
-        elif cmd == "/cancel":
-            await cancel_command(update, context)
-    else:
-        await query.answer("Dibatalkan.")
-        await safe_edit_message(
-            query.message,
-            f"❌ <i>Perintah {html.escape(cmd)} dibatalkan.</i>",
-            reply_markup=None,
-            parse_mode=ParseMode.HTML
-        )
+    await _dispatch_agent_turn(update, context, selected_text)
 
 
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1435,8 +1050,7 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     thread_id = get_effective_thread_id(update)
 
     if action.startswith("cat_"):
-        category = action[4:]
-        text, markup = get_help_menu_content(category)
+        text, markup = get_help_menu_content(action[4:])
         await safe_edit_message(query.message, text, reply_markup=markup, parse_mode=ParseMode.HTML)
     elif action == "main":
         text, markup = get_help_menu_content("main")
@@ -1450,20 +1064,13 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception:
                 pass
     elif action == "act_model":
-        await send_model_picker(chat_id, thread_id, page=0, context=context)
+        await send_model_picker(chat_id, thread_id, page=0, context=context, user_id=update.effective_user.id)
     elif action == "act_usage":
-        fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
         try:
-            report_html = await fetch_fn()
-            usage_kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("🔄 Refresh", callback_data="usage_refresh"),
-                    InlineKeyboardButton("✖️ Tutup", callback_data="msg_close")
-                ]
-            ])
-            await safe_send_message(context.bot, chat_id, report_html, reply_markup=usage_kb, parse_mode=ParseMode.HTML, message_thread_id=thread_id)
+            report_html = await fetch_agy_usage_report()
+            await safe_send_message(context.bot, chat_id, report_html, reply_markup=_usage_keyboard(), parse_mode=ParseMode.HTML, message_thread_id=thread_id)
         except Exception as e:
-            await safe_send_message(context.bot, chat_id, f"❌ Gagal mengambil kuota: {e}", message_thread_id=thread_id)
+            await safe_send_message(context.bot, chat_id, f"❌ Gagal mengambil kuota: {html.escape(str(e))}", message_thread_id=thread_id)
     elif action == "act_status":
         await status_command(update, context)
     elif action == "act_reset":
@@ -1475,6 +1082,53 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # ==============================================================================
 # AGENT WORKFLOW & MESSAGE EXECUTION
 # ==============================================================================
+_FILE_INTENT_PATTERNS = [
+    r"(?:kirim|unduh|download|minta|lihat)\s+(?:file|berkas|dokumen)?\s*[`'\"]?([a-zA-Z0-9_\-\.\/]+?\.[a-zA-Z0-9]+)[`'\"]?",
+    r"(?:kirimkan|lihatkan)\s+(?:file|berkas|dokumen)\s*[`'\"]?([a-zA-Z0-9_\-\.\/]+?\.[a-zA-Z0-9]+)[`'\"]?",
+]
+
+
+def _collect_media_paths(user_text: str, output_text: str, workspace: str) -> List[str]:
+    """
+    Gathers files to deliver: MEDIA: directives from the model, files the user explicitly
+    asked for, and an auto-exported Markdown document for long reports.
+    Every path goes through the media guard for the turn's workspace.
+    """
+    media_paths = extract_media_paths(output_text, workspace_dir=workspace)
+
+    # Smart user intent file auto-discovery ("kirim file X", "unduh berkas X")
+    for f_pat in _FILE_INTENT_PATTERNS:
+        for match in re.finditer(f_pat, user_text, re.IGNORECASE):
+            req_filename = match.group(1).strip().strip("`'\"")
+            for cand in ((Path(workspace) / req_filename).resolve(), (get_upload_dir() / req_filename).resolve()):
+                if cand.is_file():
+                    is_valid, _ = validate_media_delivery_path(str(cand), workspace)
+                    if is_valid and str(cand) not in media_paths:
+                        media_paths.append(str(cand))
+                        break
+
+    # Auto document export for long reports or explicit markdown/document requests
+    user_wants_doc = bool(re.search(r"(?:kirim|buatkan|minta)\s+(?:file|berkas|dokumen|markdown|\.md|laporan)", user_text, re.IGNORECASE))
+    if (len(output_text) > 4000 or user_wants_doc) and not any(p.endswith(".md") for p in media_paths):
+        try:
+            doc_slug = "laporan"
+            if re.search(r"keamanan|security|audit|vulnerabilit", output_text[:400], re.IGNORECASE):
+                doc_slug = "laporan_audit_keamanan"
+            elif re.search(r"ringkasan|summary", output_text[:400], re.IGNORECASE):
+                doc_slug = "ringkasan"
+
+            doc_path = get_upload_dir() / f"{doc_slug}_{int(time.time())}.md"
+            doc_path.write_text(output_text, encoding="utf-8")
+
+            is_valid, _ = validate_media_delivery_path(str(doc_path), workspace)
+            if is_valid:
+                media_paths.append(str(doc_path))
+        except Exception as e_doc:
+            logger.warning(f"Failed to auto-export markdown document: {e_doc}")
+
+    return media_paths
+
+
 async def execute_agent_turn(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1482,15 +1136,14 @@ async def execute_agent_turn(
 ):
     """
     Executes one turn against native agy CLI subprocess under user mutex lock.
-    Incorporates Hermes reactions, quiet pinning, in-place status, draft streaming,
-    and automatic topic renaming.
+    Incorporates Hermes reactions, quiet pinning, in-place status,
+    and automatic topic renaming. Works for both messages and button callbacks.
     """
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
-    raw_reply = getattr(update.message, "message_id", None)
+    raw_reply = getattr(update.message, "message_id", None) if update.message else None
     reply_id = raw_reply if isinstance(raw_reply, int) else None
 
     # 1. Hardline Security Blocklist
@@ -1552,23 +1205,38 @@ async def execute_agent_turn(
     )
 
     db = get_db()
-    active_conv = None
+    topic_binding = None
     if thread_id is not None:
+        # Topics keep isolated memory: never fall back to the root chat session
         active_conv, _ = get_conversation_for_message(chat_id, thread_id)
-    if not active_conv:
-        active_conv = user_conversations.get(user_id)
+        topic_binding = db.get_topic_binding(chat_id, thread_id)
+    else:
+        active_conv = get_root_conversation(user_id)
 
-    topic_binding = db.get_topic_binding(chat_id, thread_id) if thread_id is not None else None
     topic_workspace = topic_binding.get("workspace_path") if topic_binding else None
-    current_workspace = topic_workspace or globals().get("WORKSPACE_DIR", WORKSPACE_DIR)
+    current_workspace = topic_workspace or WORKSPACE_DIR
 
     topic_model = topic_binding.get("model_override") if topic_binding else None
     active_model = topic_model or db.get_user_model(user_id, chat_id, thread_id or "root") or DEFAULT_MODEL
     turn_success = False
 
-    run_fn = getattr(sys.modules[__name__], "run_agy_cli", run_agy_cli)
+    async def _stop_status_bubble():
+        nonlocal status_msg
+        stop_typing.set()
+        typing_task.cancel()
+        try:
+            await asyncio.wait_for(typing_task, timeout=0.5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            status_msg = None
+
     try:
-        output_text, new_conv_id = await run_fn(
+        output_text, new_conv_id = await run_agy_cli(
             user_id=user_id,
             prompt=str(user_text),
             conv_id=active_conv,
@@ -1577,92 +1245,29 @@ async def execute_agent_turn(
         )
         turn_success = True
 
-        elapsed_seconds = max(1, int(time.time() - turn_start_time))
-        duration_str = f"~{elapsed_seconds}s" if elapsed_seconds < 60 else f"~{elapsed_seconds // 60}m {elapsed_seconds % 60}s"
-
         if new_conv_id:
             if thread_id is not None:
                 bind_conversation_to_topic(chat_id, thread_id, new_conv_id)
                 asyncio.create_task(auto_rename_forum_topic(context.bot, chat_id, thread_id, str(user_text), output_text))
             else:
-                user_conversations[user_id] = new_conv_id
+                set_root_conversation(user_id, new_conv_id)
 
         # 4. Media Dispatch with strict Security Path Traversal Guard
-        media_paths = extract_media_paths(output_text, workspace_dir=current_workspace)
+        media_paths = _collect_media_paths(str(user_text), output_text, current_workspace)
 
-        # 4a. Smart User Intent File Auto-Discovery:
-        # Detect explicit file send requests (e.g. "kirim file X", "kirim berkas X", "unduh X")
-        # and attach the file from workspace if it exists and passes security validation
-        file_intent_patterns = [
-            r"(?:kirim|unduh|download|minta|lihat)\s+(?:file|berkas|dokumen)?\s*[`'\"]?([a-zA-Z0-9_\-\.\/]+?\.[a-zA-Z0-9]+)[`'\"]?",
-            r"(?:kirimkan|lihatkan)\s+(?:file|berkas|dokumen)\s*[`'\"]?([a-zA-Z0-9_\-\.\/]+?\.[a-zA-Z0-9]+)[`'\"]?",
-        ]
-        for f_pat in file_intent_patterns:
-            for match in re.finditer(f_pat, str(user_text), re.IGNORECASE):
-                req_filename = match.group(1).strip().strip("`'\"")
-                candidate_paths = [
-                    (Path(current_workspace) / req_filename).resolve(),
-                    (get_upload_dir() / req_filename).resolve(),
-                ]
-                for cand in candidate_paths:
-                    if cand.is_file():
-                        is_valid, _ = validate_media_delivery_path(str(cand), current_workspace)
-                        if is_valid and str(cand) not in media_paths:
-                            media_paths.append(str(cand))
-                            break
-
-        # 4b. Auto document export for long reports or explicit markdown/document requests
-        user_wants_doc = bool(re.search(r"(?:kirim|buatkan|minta)\s+(?:file|berkas|dokumen|markdown|\.md|laporan)", str(user_text), re.IGNORECASE))
-        if (len(output_text) > 4000 or user_wants_doc) and not any(p.endswith(".md") for p in media_paths):
-            try:
-                doc_dir = get_upload_dir()
-                doc_dir.mkdir(parents=True, exist_ok=True)
-                doc_slug = "laporan"
-                if re.search(r"keamanan|security|audit|vulnerabilit", output_text[:400], re.IGNORECASE):
-                    doc_slug = "laporan_audit_keamanan"
-                elif re.search(r"ringkasan|summary", output_text[:400], re.IGNORECASE):
-                    doc_slug = "ringkasan"
-
-                doc_filename = f"{doc_slug}_{int(time.time())}.md"
-                doc_path = doc_dir / doc_filename
-                doc_path.write_text(output_text, encoding="utf-8")
-
-                is_valid, _ = validate_media_delivery_path(str(doc_path), current_workspace)
-                if is_valid:
-                    media_paths.append(str(doc_path))
-            except Exception as e_doc:
-                logger.warning(f"Failed to auto-export markdown document: {e_doc}")
-
-        # 5. Format HTML with badge
-        formatted_html = markdown_to_telegram_html(output_text)
-        non_empty_lines = [l.strip() for l in formatted_html.splitlines() if l.strip()]
-        last_line = non_empty_lines[-1].lower() if non_empty_lines else ""
-        has_footer = bool(re.search(r"^⏱️.*(?:respons dalam|waktu respons|durasi pengerjaan)", last_line))
-        if not has_footer:
-            formatted_html = f"{formatted_html.rstrip()}\n\n⏱️ <i>Respons dalam {duration_str}</i>"
-
-        # 6. Split message safely (<4000 char)
+        # 5. Format HTML with duration badge and split safely (<4000 char)
+        formatted_html = append_duration_badge(
+            markdown_to_telegram_html(output_text),
+            int(time.time() - turn_start_time)
+        )
         chunks = split_message(formatted_html, max_length=4000)
 
         # Stop background typing loop before deleting status bubble to prevent race condition
-        stop_typing.set()
-        typing_task.cancel()
-        try:
-            await asyncio.wait_for(typing_task, timeout=0.5)
-        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-            pass
-
-        # Remove temporary waiting bubble
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            status_msg = None
+        await _stop_status_bubble()
 
         # Check if the output text has structured clarification / choice options
-        clarify_detect = detect_clarify_options(output_text)
         clarify_kb = None
+        clarify_detect = detect_clarify_options(output_text)
         if clarify_detect:
             _, options = clarify_detect
             clarify_id = str(uuid.uuid4())[:8]
@@ -1677,12 +1282,11 @@ async def execute_agent_turn(
         # Send formatted chunks
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            chunk_markup = clarify_kb if is_last else None
             await safe_send_message(
                 context.bot,
                 chat_id,
                 chunk,
-                reply_markup=chunk_markup,
+                reply_markup=clarify_kb if is_last else None,
                 parse_mode=ParseMode.HTML,
                 reply_to_message_id=reply_id if i == 0 else None,
                 message_thread_id=thread_id,
@@ -1696,19 +1300,13 @@ async def execute_agent_turn(
                 chat_id=chat_id,
                 file_path=fpath,
                 reply_to_message_id=reply_id,
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                workspace_dir=current_workspace
             )
 
     except asyncio.CancelledError:
         logger.info(f"Task user {user_id} dibatalkan.")
-        stop_typing.set()
-        typing_task.cancel()
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            status_msg = None
+        await _stop_status_bubble()
         await safe_send_message(
             context.bot,
             chat_id,
@@ -1722,19 +1320,12 @@ async def execute_agent_turn(
         raise
     except Exception as e:
         logger.error(f"Error saat mengeksekusi agy: {e}", exc_info=True)
-        stop_typing.set()
-        typing_task.cancel()
+        await _stop_status_bubble()
         err_msg = (
             f"❌ <b>Terjadi kesalahan saat memproses permintaan:</b>\n"
             f"<pre><code>{html.escape(str(e))[:1000]}</code></pre>\n\n"
             f"💡 <i>Petunjuk:</i> Pastikan binary <code>agy</code> terpasang di path yang sesuai atau gunakan <code>/reset</code>."
         )
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-            status_msg = None
         await safe_send_message(
             context.bot,
             chat_id,
@@ -1752,29 +1343,14 @@ async def execute_agent_turn(
             await on_turn_complete(context.bot, chat_id, reply_id, success=True)
 
 
-async def _dispatch_agent_turn(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    prompt: str
-):
-    """Dispatches prompt into user mutex lock queue."""
-    user_id = update.effective_user.id
+def _turn_key(update: Update) -> Tuple[Optional[int], Optional[int]]:
+    chat = update.effective_chat
+    return (chat.id if chat else None, get_effective_thread_id(update))
 
-    existing_task = user_tasks.get(user_id)
-    if existing_task and not existing_task.done():
-        if update.message:
-            await update.message.reply_text(
-                "⏳ *Antigravity sedang menyelesaikan tugas sebelumnya.*\n"
-                "Kirim `/cancel` jika Anda ingin menghentikan proses tersebut.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        return
 
+def _start_turn_task(user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
+    """Runs one agent turn in a background task under the user's mutex."""
     user_lock = get_user_lock(user_id)
-    if user_lock.locked():
-        if update.message:
-            await update.message.reply_text("⏳ Mohon tunggu sebentar, sesi Anda sedang sibuk.")
-        return
 
     async def _locked_runner():
         async with user_lock:
@@ -1783,81 +1359,158 @@ async def _dispatch_agent_turn(
     task = asyncio.create_task(_locked_runner())
     user_tasks[user_id] = task
 
-    def _cleanup_task(t):
-        if user_tasks.get(user_id) == t:
+    def _on_done(t: asyncio.Task) -> None:
+        if user_tasks.get(user_id) is t:
             user_tasks.pop(user_id, None)
+        if t.cancelled():
+            # /cancel or /reset also discards follow-ups queued behind the cancelled turn
+            user_pending_prompts.pop(user_id, None)
+            return
+        _drain_pending_prompts(user_id)
 
-    task.add_done_callback(_cleanup_task)
+    task.add_done_callback(_on_done)
+
+
+def _drain_pending_prompts(user_id: int) -> None:
+    """Starts the next queued turn, merging consecutive prompts sent to the same chat/topic."""
+    queue = user_pending_prompts.get(user_id)
+    if not queue:
+        user_pending_prompts.pop(user_id, None)
+        return
+
+    key = _turn_key(queue[0][0])
+    batch = []
+    while queue and _turn_key(queue[0][0]) == key:
+        batch.append(queue.pop(0))
+    if not queue:
+        user_pending_prompts.pop(user_id, None)
+
+    update, context, _ = batch[-1]
+    combined = "\n\n".join(prompt for _, _, prompt in batch)
+    _start_turn_task(user_id, update, context, combined)
+
+
+async def _dispatch_agent_turn(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str
+):
+    """Starts a turn, or queues the prompt when the user already has one running."""
+    user_id = update.effective_user.id
+
+    if is_user_busy(user_id):
+        queue = user_pending_prompts.setdefault(user_id, [])
+        if len(queue) >= MAX_QUEUED_PROMPTS:
+            text = (
+                f"⚠️ *Antrean penuh ({MAX_QUEUED_PROMPTS} pesan).* Tunggu tugas saat ini selesai "
+                "atau kirim /cancel untuk menghentikannya."
+            )
+        else:
+            queue.append((update, context, prompt))
+            text = (
+                f"📥 *Pesan diantrikan (#{len(queue)}).* Akan diproses otomatis setelah tugas saat ini selesai.\n"
+                "Kirim /cancel untuk membatalkan tugas beserta antreannya."
+            )
+        await safe_send_message(
+            context.bot,
+            update.effective_chat.id,
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_notification=True,
+            message_thread_id=get_effective_thread_id(update)
+        )
+        return
+
+    _start_turn_task(user_id, update, context, prompt)
 
 
 # ==============================================================================
 # INBOUND MEDIA & MESSAGE HANDLERS
 # ==============================================================================
+def _passes_chat_gating(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> Tuple[bool, str]:
+    """Group chat mention & reply gating (private chats always pass)."""
+    raw_username = getattr(context.bot, "username", "")
+    return should_process_chat_message(
+        update,
+        bot_id=getattr(context.bot, "id", None),
+        bot_username=raw_username if isinstance(raw_username, str) else "",
+        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
+        text=text
+    )
+
+
+async def _reply_error(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if update.message:
+        try:
+            await update.message.reply_text(text)
+            return
+        except Exception:
+            pass
+    await safe_send_message(context.bot, update.effective_chat.id, text, parse_mode=None)
+
+
+async def _download_inbound_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source: Any,
+    filename: str,
+    label: str
+) -> Optional[Path]:
+    """Downloads a Telegram file into the upload directory; replies with an error on failure."""
+    try:
+        file_obj = await source.get_file()
+        dest_path = (get_upload_dir() / filename).resolve()
+        await file_obj.download_to_drive(custom_path=dest_path)
+        logger.info(f"Berkas {label} berhasil diunduh ke: {dest_path}")
+        return dest_path
+    except Exception as e:
+        logger.error(f"Gagal mengunduh {label} untuk user {update.effective_user.id}: {e}", exc_info=True)
+        await _reply_error(update, context, f"❌ Gagal mengunduh {label}: {e}")
+        return None
+
+
+def _with_reply_context(update: Update, text: str) -> str:
+    if update.message and getattr(update.message, "reply_to_message", None):
+        return format_reply_context(update.message, text)
+    return text
+
+
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     if not update.message or not update.message.photo:
         return
 
-    # Group chat mention & reply gating
-    bot_id = getattr(context.bot, "id", None)
-    raw_username = getattr(context.bot, "username", "")
-    bot_username = raw_username if isinstance(raw_username, str) else ""
     caption = (update.message.caption or "").strip()
-    should_proc, _ = should_process_chat_message(
-        update,
-        bot_id=bot_id,
-        bot_username=bot_username,
-        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
-        text=caption
-    )
+    should_proc, _ = _passes_chat_gating(update, context, caption)
     if not should_proc:
         return
 
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    media_group_id = getattr(update.message, "media_group_id", None)
-
     # Route multi-photo albums to MediaGroupCollector
+    media_group_id = getattr(update.message, "media_group_id", None)
     if isinstance(media_group_id, str) and media_group_id.strip():
-        collector = getattr(sys.modules[__name__], "media_group_collector", media_group_collector)
-        enqueued = await collector.enqueue(
-            update, context, chat_id=chat_id, user_id=user_id, media_group_id=str(media_group_id)
+        enqueued = await media_group_collector.enqueue(
+            update, context,
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            media_group_id=media_group_id
         )
         if enqueued:
             return
 
-    photo = update.message.photo[-1]
-
-    try:
-        file_obj = await photo.get_file()
-        upload_dir = get_upload_dir()
-        filename = f"photo_{int(time.time())}_{uuid.uuid4().hex[:6]}.jpg"
-        dest_path = (upload_dir / filename).resolve()
-        await file_obj.download_to_drive(custom_path=dest_path)
-        logger.info(f"Foto berhasil diunduh ke: {dest_path}")
-    except Exception as e:
-        logger.error(f"Gagal mengunduh foto untuk user {user_id}: {e}", exc_info=True)
-        if update.message:
-            try:
-                await update.message.reply_text(f"❌ Gagal mengunduh foto: {e}")
-            except Exception:
-                await safe_send_message(context.bot, update.effective_chat.id, f"❌ Gagal mengunduh foto: {e}")
+    filename = f"photo_{int(time.time())}_{uuid.uuid4().hex[:6]}.jpg"
+    dest_path = await _download_inbound_file(update, context, update.message.photo[-1], filename, "foto")
+    if dest_path is None:
         return
 
-    caption_prompt = caption if caption else "Tolong periksa dan analisis gambar terlampir ini."
-    if update.message and getattr(update.message, "reply_to_message", None):
-        caption_prompt = format_reply_context(update.message, caption_prompt)
-
+    caption_prompt = _with_reply_context(update, caption or "Tolong periksa dan analisis gambar terlampir ini.")
     prompt_text = (
         f"[PENGGUNA MENGIRIMKAN GAMBAR / SCREENSHOT]\n"
         f"Berkas gambar telah disimpan di: {dest_path}\n\n"
         f"[INSTRUKSI / CAPTION PENGGUNA]:\n"
         f"{caption_prompt}"
     )
-
-    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    await dispatch_fn(update, context, prompt_text)
+    await _dispatch_agent_turn(update, context, prompt_text)
 
 
 async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1866,51 +1519,23 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
     if not update.message or not update.message.document:
         return
 
-    # Group chat mention & reply gating
-    bot_id = getattr(context.bot, "id", None)
-    raw_username = getattr(context.bot, "username", "")
-    bot_username = raw_username if isinstance(raw_username, str) else ""
     caption = (update.message.caption or "").strip()
-    should_proc, _ = should_process_chat_message(
-        update,
-        bot_id=bot_id,
-        bot_username=bot_username,
-        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
-        text=caption
-    )
+    should_proc, _ = _passes_chat_gating(update, context, caption)
     if not should_proc:
         return
 
-    user_id = update.effective_user.id
     doc = update.message.document
+    orig_name = doc.file_name or f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    safe_name = re.sub(r'[\/:*?"<>|\x00-\x1f]', '_', Path(orig_name).name).strip()
+    if not safe_name.strip("._"):
+        safe_name = f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    filename = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_{safe_name}"
 
-    try:
-        file_obj = await doc.get_file()
-        orig_name = doc.file_name or f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        clean_name = re.sub(r'[\/:*?"<>|\x00-\x1f]', '_', Path(orig_name).name).strip()
-        safe_name = clean_name
-        if not safe_name.strip("._"):
-            safe_name = f"doc_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-
-        prefix = f"{int(time.time())}_{uuid.uuid4().hex[:4]}_"
-        filename = f"{prefix}{safe_name}"
-        upload_dir = get_upload_dir()
-        dest_path = (upload_dir / filename).resolve()
-        await file_obj.download_to_drive(custom_path=dest_path)
-        logger.info(f"Dokumen '{orig_name}' berhasil diunduh ke: {dest_path}")
-    except Exception as e:
-        logger.error(f"Gagal mengunduh dokumen untuk user {user_id}: {e}", exc_info=True)
-        if update.message:
-            try:
-                await update.message.reply_text(f"❌ Gagal mengunduh dokumen: {e}")
-            except Exception:
-                await safe_send_message(context.bot, update.effective_chat.id, f"❌ Gagal mengunduh dokumen: {e}")
+    dest_path = await _download_inbound_file(update, context, doc, filename, "dokumen")
+    if dest_path is None:
         return
 
-    caption_prompt = caption if caption else "Tolong periksa, baca, dan analisis dokumen terlampir ini."
-    if update.message and getattr(update.message, "reply_to_message", None):
-        caption_prompt = format_reply_context(update.message, caption_prompt)
-
+    caption_prompt = _with_reply_context(update, caption or "Tolong periksa, baca, dan analisis dokumen terlampir ini.")
     prompt_text = (
         f"[PENGGUNA MENGIRIMKAN DOKUMEN / BERKAS]\n"
         f"Nama berkas asli: {orig_name}\n"
@@ -1918,9 +1543,7 @@ async def handle_document_message(update: Update, context: ContextTypes.DEFAULT_
         f"[INSTRUKSI / CAPTION PENGGUNA]:\n"
         f"{caption_prompt}"
     )
-
-    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    await dispatch_fn(update, context, prompt_text)
+    await _dispatch_agent_turn(update, context, prompt_text)
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1931,44 +1554,21 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg or not msg.voice:
         return
 
-    # Group chat mention & reply gating
-    bot_id = getattr(context.bot, "id", None)
-    raw_username = getattr(context.bot, "username", "")
-    bot_username = raw_username if isinstance(raw_username, str) else ""
     caption = (msg.caption or "").strip()
-    should_proc, _ = should_process_chat_message(
-        update,
-        bot_id=bot_id,
-        bot_username=bot_username,
-        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
-        text=caption
-    )
+    should_proc, _ = _passes_chat_gating(update, context, caption)
     if not should_proc:
         return
 
-    user_id = update.effective_user.id
-
-    try:
-        file_obj = await msg.voice.get_file()
-        filename = f"voice_{int(time.time())}_{uuid.uuid4().hex[:6]}.ogg"
-        upload_dir = get_upload_dir()
-        dest_path = (upload_dir / filename).resolve()
-        await file_obj.download_to_drive(custom_path=dest_path)
-        logger.info(f"Voice memo berhasil diunduh ke: {dest_path}")
-    except Exception as e:
-        logger.error(f"Gagal mengunduh voice memo: {e}")
-        if msg:
-            await msg.reply_text(f"❌ Gagal mengunduh pesan suara: {e}")
+    filename = f"voice_{int(time.time())}_{uuid.uuid4().hex[:6]}.ogg"
+    dest_path = await _download_inbound_file(update, context, msg.voice, filename, "pesan suara")
+    if dest_path is None:
         return
 
     # Speech-to-Text (STT) transcription if enabled
     transcript = None
     if TELEGRAM_STT_ENABLED:
         try:
-            transcript = await transcribe_audio_file(
-                dest_path,
-                model_name=TELEGRAM_WHISPER_MODEL
-            )
+            transcript = await transcribe_audio_file(dest_path, model_name=TELEGRAM_WHISPER_MODEL)
         except Exception as e:
             logger.warning(f"Gagal mentranskripsi pesan suara: {e}")
 
@@ -1986,8 +1586,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             f"[CATATAN / CAPTION]:\n{caption if caption else 'Mohon dengarkan dan tindak lanjuti pesan suara ini.'}"
         )
 
-    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    await dispatch_fn(update, context, prompt_text)
+    await _dispatch_agent_turn(update, context, prompt_text)
 
 
 async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1998,36 +1597,17 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if not msg or not msg.audio:
         return
 
-    bot_id = getattr(context.bot, "id", None)
-    raw_username = getattr(context.bot, "username", "")
-    bot_username = raw_username if isinstance(raw_username, str) else ""
     caption = (msg.caption or "").strip()
-    should_proc, _ = should_process_chat_message(
-        update,
-        bot_id=bot_id,
-        bot_username=bot_username,
-        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
-        text=caption
-    )
+    should_proc, _ = _passes_chat_gating(update, context, caption)
     if not should_proc:
         return
 
-    user_id = update.effective_user.id
     audio = msg.audio
     orig_name = audio.file_name or f"audio_{int(time.time())}.mp3"
-
-    try:
-        file_obj = await audio.get_file()
-        ext = Path(orig_name).suffix or ".mp3"
-        filename = f"audio_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
-        upload_dir = get_upload_dir()
-        dest_path = (upload_dir / filename).resolve()
-        await file_obj.download_to_drive(custom_path=dest_path)
-        logger.info(f"Berkas audio '{orig_name}' berhasil diunduh ke: {dest_path}")
-    except Exception as e:
-        logger.error(f"Gagal mengunduh audio: {e}")
-        if msg:
-            await msg.reply_text(f"❌ Gagal mengunduh berkas audio: {e}")
+    ext = Path(orig_name).suffix or ".mp3"
+    filename = f"audio_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
+    dest_path = await _download_inbound_file(update, context, audio, filename, "berkas audio")
+    if dest_path is None:
         return
 
     title_info = f"Judul: {audio.title}" if audio.title else ""
@@ -2042,9 +1622,7 @@ async def handle_audio_message(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Berkas tersimpan di: {dest_path}\n\n"
         f"[CATATAN / CAPTION]:\n{caption if caption else 'Tolong periksa berkas audio ini.'}"
     )
-
-    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    await dispatch_fn(update, context, prompt_text)
+    await _dispatch_agent_turn(update, context, prompt_text)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2054,40 +1632,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Unauthorized text message attempt from User ID: {user_id}")
         return
 
-    raw_thread = getattr(update.message, "message_thread_id", None)
-    thread_id = raw_thread if isinstance(raw_thread, int) else None
+    thread_id = get_effective_thread_id(update)
 
     # Expand any hidden text_link URLs
     user_text = ""
-    if update.message:
-        if isinstance(update.message.text, str):
-            user_text = expand_link_entities(update.message)
-        elif isinstance(getattr(update.message, "caption", None), str):
-            user_text = expand_link_entities(update.message)
+    if update.message and (
+        isinstance(update.message.text, str) or isinstance(getattr(update.message, "caption", None), str)
+    ):
+        user_text = expand_link_entities(update.message)
 
-    raw_username = getattr(context.bot, "username", "")
-    bot_username = raw_username if isinstance(raw_username, str) else ""
-    bot_id = getattr(context.bot, "id", None)
-
-    # Group chat mention & reply gating
-    should_proc, user_text = should_process_chat_message(
-        update,
-        bot_id=bot_id,
-        bot_username=bot_username,
-        require_mention=TELEGRAM_REQUIRE_MENTION_IN_GROUPS,
-        text=user_text
-    )
+    should_proc, user_text = _passes_chat_gating(update, context, user_text)
     if not should_proc:
         return
 
-    user_text = clean_bot_mentions(user_text, bot_username)
-
+    raw_username = getattr(context.bot, "username", "")
+    user_text = clean_bot_mentions(user_text, raw_username if isinstance(raw_username, str) else "")
     if not user_text.strip():
         return
 
     # Intent Interceptor: Quota / Usage Inquiry
-    inquiry_fn = getattr(sys.modules[__name__], "is_quota_inquiry", is_quota_inquiry)
-    if inquiry_fn(user_text):
+    if is_quota_inquiry(user_text):
         status_msg = await safe_send_message(
             context.bot,
             update.effective_chat.id,
@@ -2095,9 +1659,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
             message_thread_id=thread_id
         )
-        fetch_fn = getattr(sys.modules[__name__], "fetch_agy_usage_report", fetch_agy_usage_report)
         try:
-            report_html = await fetch_fn()
+            report_html = await fetch_agy_usage_report()
             if status_msg:
                 await safe_edit_message(status_msg, report_html, parse_mode=ParseMode.HTML)
             else:
@@ -2107,28 +1670,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check and prepend reply context if user is replying to a message
-    if update.message and getattr(update.message, "reply_to_message", None):
-        user_text = format_reply_context(update.message, user_text)
+    user_text = _with_reply_context(update, user_text)
 
     # Route through TextDebouncer if debounce window is active (>0)
-    debounce_sec = getattr(sys.modules[__name__], "TELEGRAM_DEBOUNCE_SECONDS", TELEGRAM_DEBOUNCE_SECONDS)
-    dispatch_fn = getattr(sys.modules[__name__], "_dispatch_agent_turn", _dispatch_agent_turn)
-    if debounce_sec > 0:
-        debouncer = getattr(sys.modules[__name__], "text_debouncer", text_debouncer)
-        user_id = update.effective_user.id
-        chat_id = update.effective_chat.id
-        enqueued = await debouncer.enqueue(
-            update, context, user_text, chat_id=chat_id, user_id=user_id, thread_id=thread_id
+    if TELEGRAM_DEBOUNCE_SECONDS > 0:
+        enqueued = await text_debouncer.enqueue(
+            update, context, user_text,
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id,
+            thread_id=thread_id
         )
-        if not enqueued:
-            await dispatch_fn(update, context, user_text)
-    else:
-        await dispatch_fn(update, context, user_text)
+        if enqueued:
+            return
+    await _dispatch_agent_turn(update, context, user_text)
 
 
 # ==============================================================================
 # LIFECYCLE HOOKS & APPLICATION BUILDER
 # ==============================================================================
+async def _restart_polling(application) -> None:
+    """Soft recovery for a stalled long-poll; escalates to a process restart on failure."""
+    updater = getattr(application, "updater", None)
+    if updater is None:
+        return
+    logger.warning("♻️ Memulai ulang long polling Telegram setelah stall terdeteksi...")
+    try:
+        if updater.running:
+            await updater.stop()
+        await updater.start_polling()
+        stall_watchdog.record_progress()
+        logger.info("✓ Long polling berhasil dimulai ulang.")
+    except Exception as e:
+        logger.critical(
+            f"Gagal memulai ulang polling ({redact_telegram_error_text(e)}). "
+            f"Menghentikan aplikasi agar supervisor (systemd/docker) melakukan restart."
+        )
+        application.stop_running()
+
+
 async def post_init(application):
     """Registers bot commands with Telegram API on startup and starts watchdog."""
     commands = [
@@ -2151,9 +1730,17 @@ async def post_init(application):
     except Exception as e:
         logger.warning(f"Gagal mendaftarkan bot commands: {e}")
 
+    try:
+        pruned = get_db().prune_expired_receipts()
+        if pruned:
+            logger.info(f"✓ {pruned} receipt anti-replay kedaluwarsa dibersihkan.")
+    except Exception as e:
+        logger.warning(f"Gagal membersihkan receipt anti-replay: {e}")
+
     # Start PollingStallWatchdog if running in polling mode
     if not TELEGRAM_WEBHOOK_URL:
         try:
+            stall_watchdog.on_stall_callback = lambda: _restart_polling(application)
             stall_watchdog.start(application)
             logger.info("✓ Polling stall watchdog aktif.")
         except Exception as e:
@@ -2174,10 +1761,11 @@ async def post_shutdown(application):
     except Exception:
         pass
 
-    for user_id, proc in list(user_processes.items()):
+    user_pending_prompts.clear()
+    for proc in list(user_processes.values()):
         try:
             if proc.returncode is None:
-                proc.terminate()
+                terminate_process_tree(proc)
         except Exception:
             pass
     user_processes.clear()
@@ -2207,6 +1795,11 @@ def main():
     logger.info(f"🛡️ Whitelist User IDs : {ALLOWED_USER_IDS}")
     logger.info(f"⚙️ Approval Mode      : {APPROVAL_MODE} (Timeout: {APPROVAL_TIMEOUT_SECONDS}s)")
     logger.info(f"📁 Workspace Path     : {WORKSPACE_DIR}")
+    if AGY_SKIP_PERMISSIONS:
+        logger.warning(
+            "⚠️ AGY_SKIP_PERMISSIONS=true: agy menjalankan tool tanpa konfirmasi. "
+            "Hermes Guard hanya memeriksa teks instruksi, bukan aksi agent."
+        )
 
     try:
         request_client = build_resilient_request(
@@ -2223,6 +1816,9 @@ def main():
             .build()
         )
 
+        # Ingress gate: whitelist + anti-replay for every update, before any other handler
+        app.add_handler(TypeHandler(Update, ingress_gate), group=-1)
+
         # Command Handlers
         app.add_handler(CommandHandler("start", start_command))
         app.add_handler(CommandHandler("help", help_command))
@@ -2238,7 +1834,7 @@ def main():
         app.add_handler(CommandHandler(["reset", "new", "clear"], reset_command))
         app.add_handler(CommandHandler("cancel", cancel_command))
 
-        # Callback Query Handlers (Approval, Model selection, Clarify, Slash Confirm)
+        # Callback Query Handlers (Approval, Model selection, Clarify, Help)
         app.add_handler(CallbackQueryHandler(handle_callback_query))
 
         # Media Handlers

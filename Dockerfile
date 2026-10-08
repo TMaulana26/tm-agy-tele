@@ -19,8 +19,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Salin script bot
-COPY bot.py .
+# Salin seluruh modul bot (bot.py mengimpor config, core, tele, dan database)
+COPY bot.py config.py ./
+COPY core/ ./core/
+COPY tele/ ./tele/
+COPY database/ ./database/
 
 # Buat folder workspace kerja
 RUN mkdir -p /workspace

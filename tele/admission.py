@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 import logging
 from collections import OrderedDict
-from typing import Any, Optional, Dict
+from typing import Any, Callable, Optional
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -61,7 +61,25 @@ def is_update_admitted(bot_id: Any, update_id: Any) -> bool:
     except Exception as e:
         logger.warning(f"Failed to record update receipt in database: {e}")
 
+    _maybe_prune_receipts(db)
     return True
+
+
+_PRUNE_EVERY_N_ADMITTED = 500
+_admitted_since_prune = 0
+
+
+def _maybe_prune_receipts(db: Any) -> None:
+    """Prunes receipts older than 24h every N admitted updates to keep the table bounded."""
+    global _admitted_since_prune
+    _admitted_since_prune += 1
+    if _admitted_since_prune < _PRUNE_EVERY_N_ADMITTED:
+        return
+    _admitted_since_prune = 0
+    try:
+        db.prune_expired_receipts()
+    except Exception as e:
+        logger.debug(f"Failed to prune update receipts: {e}")
 
 
 _progress_listener: Optional[Callable[[], None]] = None

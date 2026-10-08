@@ -1,0 +1,16 @@
+.env
+*.env.local
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.swarm/
+.telegram_state/
+.telegram_uploads/
+.gemini/
+workspace/
+tests/
+test_bot.py
+*.db
+*.log

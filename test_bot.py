@@ -22,6 +22,8 @@ os.environ["APPROVAL_TIMEOUT_SECONDS"] = "2"
 os.environ["AGY_BIN_PATH"] = "agy"
 
 import bot
+import database.state
+from database.state import StateDatabase
 
 class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
 
@@ -31,6 +33,15 @@ class TestAntigravityBot(unittest.IsolatedAsyncioTestCase):
         bot.user_processes.clear()
         bot.user_tasks.clear()
         bot.user_locks.clear()
+        bot.user_pending_prompts.clear()
+        # Keep test state out of the real workspace database
+        import tempfile
+        self._db_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        database.state._db_singleton = StateDatabase(Path(self._db_tmp.name) / "test_bot.db")
+
+    def tearDown(self):
+        database.state._db_singleton = None
+        self._db_tmp.cleanup()
 
     # --------------------------------------------------------------------------
     # 1. MESSAGE CHUNKING & SPLITTING
@@ -729,7 +740,7 @@ docker ps -a
             ]
             transcript_file.write_text("\n".join(lines), encoding="utf-8")
 
-            with patch("bot.WORKSPACE_DIR", tmpdir):
+            with patch("core.agy_engine.WORKSPACE_DIR", tmpdir):
                 recovered, res_id = bot.recover_last_response_from_transcript(conv_id)
                 self.assertEqual(recovered, "Siap! Cron job sudah aktif.")
                 self.assertEqual(res_id, conv_id)
@@ -752,7 +763,7 @@ docker ps -a
             ]
             transcript_file.write_text("\n".join(lines), encoding="utf-8")
 
-            with patch("bot.WORKSPACE_DIR", tmpdir):
+            with patch("core.agy_engine.WORKSPACE_DIR", tmpdir):
                 recovered, res_id = bot.recover_last_response_from_transcript(conv_id)
                 # Harus None karena terhenti di baris USER_INPUT sebelum ada PLANNER_RESPONSE baru
                 self.assertIsNone(recovered)
@@ -773,7 +784,7 @@ docker ps -a
             ]
             transcript_file.write_text("\n".join(lines), encoding="utf-8")
 
-            with patch("bot.WORKSPACE_DIR", tmpdir):
+            with patch("core.agy_engine.WORKSPACE_DIR", tmpdir):
                 # conv_id None (sesi baru)
                 recovered, res_id = bot.recover_last_response_from_transcript(None)
                 self.assertEqual(recovered, "Halo! Ini jawaban sesi baru.")
@@ -789,7 +800,7 @@ docker ps -a
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
             with patch("os.path.exists", return_value=True):
-                with patch("bot.recover_last_response_from_transcript", return_value=("Jawaban pulih!", "conv-timeout-1")):
+                with patch("core.agy_engine.recover_last_response_from_transcript", return_value=("Jawaban pulih!", "conv-timeout-1")):
                     resp, conv_id = await bot.run_agy_cli(
                         user_id=111111,
                         prompt="tugas berat",
@@ -814,7 +825,7 @@ docker ps -a
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             with patch("os.path.exists", return_value=True):
-                with patch("bot.recover_last_response_from_transcript", return_value=(None, "conv-timeout-2")):
+                with patch("core.agy_engine.recover_last_response_from_transcript", return_value=(None, "conv-timeout-2")):
                     resp, conv_id = await bot.run_agy_cli(
                         user_id=111111,
                         prompt="tugas berat macet",
@@ -845,7 +856,7 @@ docker ps -a
             art_file = conv_dir / "audit.md"
             art_file.write_text("# Laporan Audit Bot", encoding="utf-8")
 
-            with patch("bot.WORKSPACE_DIR", tmpdir):
+            with patch("core.agy_engine.WORKSPACE_DIR", tmpdir):
                 recovered, res_id = bot.recover_last_response_from_transcript(conv_id)
                 self.assertIsNotNone(recovered)
                 self.assertIn("Laporan Audit Bot", recovered)
@@ -865,7 +876,7 @@ docker ps -a
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             with patch("os.path.exists", return_value=True):
-                with patch("bot.recover_last_response_from_transcript", return_value=("# Laporan Selesai", "conv-empty-bot-1")):
+                with patch("core.agy_engine.recover_last_response_from_transcript", return_value=("# Laporan Selesai", "conv-empty-bot-1")):
                     resp, conv_id = await bot.run_agy_cli(
                         user_id=111111,
                         prompt="tulis laporan",
@@ -889,7 +900,7 @@ docker ps -a
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             with patch("os.path.exists", return_value=True):
-                with patch("bot.recover_last_response_from_transcript", return_value=(None, "conv-empty-bot-2")):
+                with patch("core.agy_engine.recover_last_response_from_transcript", return_value=(None, "conv-empty-bot-2")):
                     resp, conv_id = await bot.run_agy_cli(
                         user_id=111111,
                         prompt="tugas tanpa teks",

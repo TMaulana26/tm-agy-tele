@@ -11,7 +11,7 @@ Arsitektur ini **menggunakan sesi login Google Antigravity resmi yang sudah akti
 
 Bot ini dilengkapi fitur lengkap **paritas Hermes Agent**:
 - **Private Chat Topics (Bot API 9.4)**: Multi-session terisolasi di dalam DM dengan *auto-renaming*.
-- **Draft Streaming (Bot API 9.5)**: Streaming respons token-by-token via `sendMessageDraft`.
+- **Status Bubble & Antrean Pesan**: Indikator progres in-place selama `agy` bekerja, dan pesan susulan otomatis diantrikan lalu diproses setelah tugas selesai.
 - **Interactive Help Center & Model Picker**: Navigasi tombol inline untuk `/help` dan `/model`.
 - **Hermes Guard**: Fail-closed interactive approval gate, hardline command blocklist, dan media path traversal guard.
 - **DNS-over-HTTPS & Fallback Transport**: Tahan sensor/blokir ISP pada domain `api.telegram.org`.
@@ -130,7 +130,7 @@ Buka aplikasi Telegram di HP atau Laptop Anda, lalu cari bot yang baru Anda buat
 4. **Ketik `/topic Refactor Auth`**: Buat topik obrolan terisolasi pertama Anda di dalam DM.
 5. **Kirim Instruksi Koding**: Kirimkan instruksi koding apapun (contoh: *"Buatkan script bash backup database"*).
    - Perhatikan reaksi native emoji `👀` yang muncul saat turn dimulai.
-   - Perhatikan streaming respons teks secara langsung (*Bot API 9.5 Draft Streaming*).
+   - Perhatikan status bubble `⏳ ... (Ns)` yang diperbarui selama `agy` bekerja.
    - Perhatikan reaksi emoji `👍` begitu tugas selesai dikerjakan!
 
 ---
@@ -254,11 +254,13 @@ Seluruh 12 perintah ini terdaftar resmi di menu autocomplete Telegram (cukup ket
 ## 🔒 Arsitektur Keamanan (Hermes Guard)
 
 1. **Long Polling Outbound**: Bot berkomunikasi keluar ke server Telegram via HTTPS (Port 443 outbound). **Tidak memerlukan port inbound terbuka** pada firewall VPS Anda (`ufw`).
-2. **Whitelist Authorization**: Hanya Telegram User ID yang terdaftar pada `ALLOWED_USER_ID` di file `.env` yang dapat mengakses dan mengeksekusi bot. Pesan dari pihak lain otomatis ditolak.
-3. **Hardline Security Blocklist**: Perintah katastropik sistem (`rm -rf /`, `mkfs`, `dd`, `shutdown`, forkbomb) otomatis dicegat dan dibatalkan tanpa eksekusi.
-4. **Fail-Closed Intent Guard**: Perintah berisiko (drop table, rm -rf, git force) memunculkan tombol konfirmasi interaktif `[ Approve ]` / `[ Deny ]` dengan batas waktu 120 detik (*fail-closed*).
-5. **Media Path Traversal Protection**: Melarang pengiriman file kredensial sistem (`.env`, `state.db`, `auth.json`, SSH keys) keluar melalui Telegram.
+2. **Whitelist Ingress Gate**: Setiap update (pesan, perintah termasuk `/topic` & `/model`, media, dan klik tombol) melewati gerbang `ingress_gate` sebelum handler apa pun. Hanya Telegram User ID pada `ALLOWED_USER_ID` yang diproses; pihak lain hanya bisa memakai `/start` untuk melihat ID mereka.
+3. **Hardline Security Blocklist**: Perintah katastropik sistem (`rm -rf /`, `mkfs`, `dd`, `shutdown` di posisi perintah, forkbomb) otomatis dicegat dan dibatalkan tanpa eksekusi.
+4. **Fail-Closed Intent Guard**: Perintah berisiko (drop table, rm -rf, git force, reboot) memunculkan tombol konfirmasi interaktif `[ Approve ]` / `[ Deny ]` dengan batas waktu 120 detik (*fail-closed*).
+5. **Media Path Traversal Protection**: Melarang pengiriman file kredensial (`.env`, `*.db`, `*.pem`, `*.key`, `auth.json`, SSH keys, `.npmrc`, service account JSON) keluar melalui Telegram. Workspace topik (`/topic --path=`) dibatasi ke `TOPIC_WORKSPACE_ROOTS`.
 6. **Anti-Replay Update Admission**: Mencegah duplikasi eksekusi pesan saat restart atau jaringan flapping via tabel `telegram_update_receipts`.
+
+> ⚠️ **Batas perlindungan**: Blocklist & approval memeriksa **teks instruksi Anda**, bukan setiap aksi agent. Dengan `AGY_SKIP_PERMISSIONS=true` (default), `agy` bebas menjalankan tool di VPS, sehingga dokumen atau halaman web yang diproses agent dapat berisi *prompt injection*. Jalankan bot sebagai user non-root dengan `WORKSPACE_DIR` sesempit mungkin.
 
 ---
 

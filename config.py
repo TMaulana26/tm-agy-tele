@@ -10,7 +10,7 @@ import os
 import shutil
 import logging
 from pathlib import Path
-from typing import Set
+from typing import List, Set
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -66,6 +66,28 @@ def resolve_workspace_dir() -> str:
         return str(fallback_cwd)
 
 WORKSPACE_DIR: str = resolve_workspace_dir()
+
+
+def resolve_topic_workspace_roots() -> List[str]:
+    """
+    Directories under which a forum topic may bind a custom workspace (/topic --path=...).
+    Configured via TOPIC_WORKSPACE_ROOTS (comma-separated). Defaults to WORKSPACE_DIR and
+    the bot user's home directory.
+    """
+    raw = os.getenv("TOPIC_WORKSPACE_ROOTS", "").strip()
+    entries = [p.strip() for p in raw.split(",") if p.strip()] if raw else [WORKSPACE_DIR, str(Path.home())]
+    roots: List[str] = []
+    for entry in entries:
+        try:
+            resolved = str(Path(entry).expanduser().resolve())
+        except (OSError, RuntimeError):
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    return roots
+
+
+TOPIC_WORKSPACE_ROOTS: List[str] = resolve_topic_workspace_roots()
 
 def get_upload_dir() -> Path:
     """Returns directory for Telegram uploads."""

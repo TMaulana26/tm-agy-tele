@@ -2,14 +2,12 @@
 """
 Interactive Question & Clarification Buttons (Ala Hermes feat/clarify-gateway-buttons).
 Transforms structured multiple-choice questions into interactive Telegram Inline Keyboard buttons.
-Also provides interactive confirmation dialogs for destructive slash commands (/reset, /cancel).
 Adapted from hermes-agent gateway/platforms/telegram/adapter.py and test_telegram_clarify_buttons.py.
 """
 
 from __future__ import annotations
 
 import re
-import html
 import uuid
 import logging
 from typing import Optional, List, Tuple, Dict, Any, Union
@@ -17,12 +15,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("antigravity-tele-bot.clarify")
 
-# Store in-flight clarify and slash confirm prompts:
-# clarify_id -> {"user_id": int, "chat_id": int, "thread_id": Optional[int], "choices": List[str], "created_at": float}
+# Store in-flight clarify prompts:
+# clarify_id -> {"user_id": int, "chat_id": int, "thread_id": Optional[int], "choices": List[str]}
 _pending_clarifications: Dict[str, Dict[str, Any]] = {}
-
-# confirm_id -> {"user_id": int, "chat_id": int, "thread_id": Optional[int], "command": str, "future": asyncio.Future}
-_pending_slash_confirms: Dict[str, Dict[str, Any]] = {}
 
 
 def detect_clarify_options(text: str) -> Optional[Tuple[str, List[str]]]:
@@ -37,42 +32,65 @@ def detect_clarify_options(text: str) -> Optional[Tuple[str, List[str]]]:
     Or checkbox list:
        "- [ ] Option A
         - [ ] Option B"
+    Only a list that closes the message and is introduced as a choice (a choice keyword
+    or a question mark) qualifies, so ordinary bulleted reports do not grow buttons.
     """
     if not text:
         return None
 
-    # 1. Look for numbered list items (e.g. 1. ..., 2. ...)
-    pattern_num = re.compile(r"(?m)^[ \t]*([1-9]\d?)\.\s+([^\n]+)$")
-    matches = list(pattern_num.finditer(text))
-    if 2 <= len(matches) <= 8:
-        expected = 1
-        options = []
-        is_seq = True
-        for m in matches:
-            if int(m.group(1)) != expected:
-                is_seq = False
-                break
-            options.append(m.group(2).strip())
-            expected += 1
-        if is_seq:
-            first_match_start = matches[0].start()
-            intro = text[:first_match_start].strip().splitlines()
-            question = intro[-1].strip() if intro else "Pilih salah satu opsi berikut:"
-            question = re.sub(r"^[*\-#\s:]+", "", question).strip() or "Pilih salah satu opsi berikut:"
-            return question, options
+    # 1. Numbered list items (e.g. 1. ..., 2. ...) numbered sequentially from 1
+    block = _trailing_block(text, _NUMBERED_RE)
+    if block and [int(m.group(1)) for m in block] == list(range(1, len(block) + 1)):
+        question = _choice_question(text, block)
+        if question:
+            return question, [m.group(2).strip() for m in block]
 
-    # 2. Look for checkbox or bullet items (e.g. - [ ] ..., * [ ] ..., or - ..., * ...)
-    pattern_bullet = re.compile(r"(?m)^[ \t]*[-*]\s+(?:\[[ xX]?\]\s+)?([^\n]+)$")
-    matches_b = list(pattern_bullet.finditer(text))
-    if 2 <= len(matches_b) <= 8:
-        options = [m.group(1).strip() for m in matches_b]
-        first_match_start = matches_b[0].start()
-        intro = text[:first_match_start].strip().splitlines()
-        question = intro[-1].strip() if intro else "Pilih salah satu opsi berikut:"
-        question = re.sub(r"^[*\-#\s:]+", "", question).strip() or "Pilih salah satu opsi berikut:"
-        return question, options
+    # 2. Checkbox or bullet items (e.g. - [ ] ..., * [ ] ..., or - ..., * ...)
+    block = _trailing_block(text, _BULLET_RE)
+    if block:
+        question = _choice_question(text, block)
+        if question:
+            return question, [m.group(1).strip() for m in block]
 
     return None
+
+
+_NUMBERED_RE = re.compile(r"(?m)^[ \t]*([1-9]\d?)\.\s+([^\n]+)$")
+_BULLET_RE = re.compile(r"(?m)^[ \t]*[-*]\s+(?:\[[ xX]?\]\s+)?([^\n]+)$")
+_CHOICE_INTRO_RE = re.compile(
+    r"\b(?:pilih|pilihan|opsi|mana|mau|ingin|lanjutkan|choose|select|pick|options?|which|prefer)\b",
+    re.IGNORECASE,
+)
+_MAX_TRAILING_QUESTION_CHARS = 200
+
+
+def _trailing_block(text: str, pattern: re.Pattern) -> Optional[List[re.Match]]:
+    """Returns the last run of consecutive list lines if it holds 2-8 items."""
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return None
+    block = [matches[-1]]
+    for m in reversed(matches[:-1]):
+        if text[m.end():block[0].start()].strip():
+            break
+        block.insert(0, m)
+    return block if 2 <= len(block) <= 8 else None
+
+
+def _choice_question(text: str, block: List[re.Match]) -> Optional[str]:
+    """Returns the question introducing the list, or None if the list is not a choice."""
+    trailing = text[block[-1].end():].strip()
+    trailing_is_question = (
+        bool(trailing) and trailing.endswith("?") and len(trailing) <= _MAX_TRAILING_QUESTION_CHARS
+    )
+    if trailing and not trailing_is_question:
+        return None
+
+    intro = text[:block[0].start()].strip().splitlines()
+    question = intro[-1].strip() if intro else ""
+    if not (trailing_is_question or question.endswith("?") or _CHOICE_INTRO_RE.search(question)):
+        return None
+    return re.sub(r"^[*\-#\s:]+", "", question).strip() or "Pilih salah satu opsi berikut:"
 
 
 def build_clarify_keyboard(
@@ -105,16 +123,6 @@ def build_clarify_keyboard(
     return kb
 
 
-def build_slash_confirm_keyboard(confirm_id: str) -> InlineKeyboardMarkup:
-    """Constructs confirmation keyboard [ ✅ Ya, Lanjutkan ] [ ❌ Batal ] for slash commands."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Ya, Lanjutkan", callback_data=f"sc:{confirm_id}:approve"),
-            InlineKeyboardButton("❌ Batal", callback_data=f"sc:{confirm_id}:deny"),
-        ]
-    ])
-
-
 def register_clarification(clarify_id: str, data: Dict[str, Any]) -> None:
     """Registers pending clarification session."""
     _pending_clarifications[clarify_id] = data
@@ -130,18 +138,3 @@ def get_clarification(clarify_id: str) -> Optional[Dict[str, Any]]:
 
 def pop_clarification(clarify_id: str) -> Optional[Dict[str, Any]]:
     return _pending_clarifications.pop(clarify_id, None)
-
-
-def register_slash_confirm(confirm_id: str, data: Dict[str, Any]) -> None:
-    _pending_slash_confirms[confirm_id] = data
-    if len(_pending_slash_confirms) > 256:
-        oldest_key = next(iter(_pending_slash_confirms))
-        _pending_slash_confirms.pop(oldest_key, None)
-
-
-def get_slash_confirm(confirm_id: str) -> Optional[Dict[str, Any]]:
-    return _pending_slash_confirms.get(confirm_id)
-
-
-def pop_slash_confirm(confirm_id: str) -> Optional[Dict[str, Any]]:
-    return _pending_slash_confirms.pop(confirm_id, None)

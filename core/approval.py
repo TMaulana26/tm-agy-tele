@@ -30,16 +30,21 @@ HARDLINE_BLOCKLIST = [
     r">\s*/dev/(?:sd[a-z]|nvme[0-9]|hd[a-z]|vd[a-z])",
     r"chmod\s+-[rR]\s+777\s+/(?:\s|$)",
     r"chown\s+-[rR]\s+.*\s+/(?:\s|$)",
-    r"(?:^|[\s;&|])(?:shutdown|reboot|poweroff|halt|init\s+0)(?:$|[\s;&|])",
+    # Power commands only in command position (line start, after a shell operator, sudo or
+    # systemctl), so prose such as "why did the server reboot?" is not blocked outright.
+    r"(?:^|[;&|]\s*|\bsudo\s+|\bsystemctl\s+)(?:shutdown|reboot|poweroff|halt|init\s+0)(?=$|[\s;&|])",
     r"\brm\s+.*-(?:[a-zA-Z0-9]*[rR]|--recursive).*/(?:\*|\s|$)"
 ]
 
 
 def is_hardline_blocked(prompt: str) -> bool:
-    """Checks whether prompt contains catastrophic system-level commands."""
+    """
+    Checks whether prompt contains catastrophic system-level commands.
+    This inspects the user's text only; it is a tripwire, not a sandbox for agent actions.
+    """
     p_clean = prompt.strip()
     for pattern in HARDLINE_BLOCKLIST:
-        if re.search(pattern, p_clean, re.IGNORECASE):
+        if re.search(pattern, p_clean, re.IGNORECASE | re.MULTILINE):
             return True
     return False
 
@@ -55,6 +60,7 @@ DESTRUCTIVE_PATTERNS = [
     r"\bgit\s+(?:reset\s+--hard|clean\s+-[a-zA-Z0-9]*f|push\s+.*--force)\b",
     r"\bdocker\s+(?:rm|rmi|system\s+prune|compose\s+down\s+-v)\b",
     r"\b(?:kill\s+-9|pkill\s+-9|killall)\b",
+    r"\b(?:reboot|shutdown|poweroff)\b",
     r"\bformat\s+(?:disk|drive)\b",
 ]
 

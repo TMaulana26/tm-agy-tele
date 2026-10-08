@@ -12,13 +12,18 @@ services:
       - TZ=Asia/Jakarta
       - PYTHONUNBUFFERED=1
       - WORKSPACE_DIR=/workspace
+      # Binary agy diambil dari folder ~/.gemini host yang di-mount di bawah.
+      # Sesuaikan via CONTAINER_AGY_BIN_PATH di .env bila instalasi agy Akang berbeda.
+      - AGY_BIN_PATH=${CONTAINER_AGY_BIN_PATH:-/root/.gemini/antigravity-cli/bin/agy}
     volumes:
-      # Mount folder kredensial Antigravity host ke container (read-only)
+      # Folder kredensial & state Antigravity host. Harus read-write karena agy
+      # menulis transkrip percakapan (brain/) dan memperbarui token login.
       # Di VPS Linux: ~/.gemini
       # Di Windows: ${USERPROFILE}/.gemini (dapat dikonfigurasi via HOST_GEMINI_DIR di .env)
-      - ${HOST_GEMINI_DIR:-~/.gemini}:/root/.gemini:ro
-      # Mount folder workspace kodingan host ke dalam container
-      - .:/workspace
+      - ${HOST_GEMINI_DIR:-~/.gemini}:/root/.gemini
+      # Folder proyek yang boleh dikerjakan agent. Jangan arahkan ke repo bot ini
+      # sendiri karena berisi .env (token bot).
+      - ${HOST_WORKSPACE_DIR:-./workspace}:/workspace
     # Isolasi resource VPS agar bot stabil di VPS kapasitas 1-2 GB RAM
     deploy:
       resources:

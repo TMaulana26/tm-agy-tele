@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
 Antigravity CLI Subprocess Engine & Transcript Recovery.
-Spawns native agy binary asynchronously, manages multi-turn sessions, models,
-transcript-based error recovery, and process cancellation.
+Spawns the native agy binary asynchronously, manages multi-turn sessions, models,
+transcript-based error recovery, and process-tree cancellation.
+
+This module is the single source of truth for the engine; bot.py re-exports its names.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import json
 import time
 import shutil
+import signal
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List, Any
+from typing import Dict, Optional, Tuple, List
 
 from config import (
     AGY_BIN_PATH,
@@ -28,7 +30,7 @@ from config import (
 
 logger = logging.getLogger("antigravity-tele-bot.engine")
 
-# Global registries for state and cancellation
+# Global registries for state and cancellation (shared with bot.py by reference)
 user_conversations: Dict[int, str] = {}
 user_processes: Dict[int, asyncio.subprocess.Process] = {}
 user_locks: Dict[int, asyncio.Lock] = {}
@@ -42,14 +44,45 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
     return user_locks[user_id]
 
 
-def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optional[str]]:
+# ==============================================================================
+# PROCESS TREE TERMINATION
+# ==============================================================================
+def terminate_process_tree(proc, force: bool = False) -> None:
     """
-    Searches for transcript.jsonl for a given conversation ID or the newest session.
-    Returns (transcript_path, resolved_conv_id).
+    Sends SIGTERM (or SIGKILL when force=True) to the agy process and its children.
+    On POSIX the subprocess is started in its own session, so signalling the process
+    group also stops tool commands spawned by agy. Falls back to the single process.
     """
-    candidate_bases: List[Path] = []
+    if os.name != "nt" and isinstance(proc, asyncio.subprocess.Process):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL if force else signal.SIGTERM)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        if force:
+            proc.kill()
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        pass
+
+
+# ==============================================================================
+# TRANSCRIPT DISCOVERY & RECOVERY
+# ==============================================================================
+def _safe_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except (PermissionError, OSError):
+        return False
+
+
+def list_brain_bases() -> List[Path]:
+    """Lists existing agy brain directories (bounded-depth scan, no recursive glob)."""
     home = Path.home()
-    candidate_bases.extend([
+    workspace_gemini = Path(WORKSPACE_DIR) / ".gemini"
+    candidates: List[Path] = [
         home / ".gemini" / "antigravity-cli" / "brain",
         home / ".gemini" / "antigravity" / "brain",
         home / ".gemini" / "brain",
@@ -57,33 +90,66 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
         Path("/home/ubuntu/.gemini/antigravity/brain"),
         Path("/home/ubuntu/.gemini/brain"),
         Path("/root/.gemini/brain"),
-        Path(WORKSPACE_DIR) / ".gemini" / "brain",
-    ])
+        workspace_gemini / "brain",
+    ]
 
-    # Dynamic recursive scan under ~/.gemini for any brain folders
-    search_parents = [home / ".gemini", Path("/home/ubuntu/.gemini"), Path(WORKSPACE_DIR) / ".gemini"]
-    for sp in search_parents:
-        try:
-            if sp.is_dir():
-                for b_dir in sp.glob("**/brain"):
-                    try:
-                        if b_dir.is_dir() and b_dir not in candidate_bases:
-                            candidate_bases.append(b_dir)
-                    except (PermissionError, OSError):
-                        pass
-        except (PermissionError, OSError):
-            pass
+    for parent in (home / ".gemini", Path("/home/ubuntu/.gemini"), workspace_gemini):
+        if not _safe_is_dir(parent):
+            continue
+        for pattern in ("*/brain", "*/*/brain"):
+            try:
+                for b_dir in parent.glob(pattern):
+                    if b_dir not in candidates:
+                        candidates.append(b_dir)
+            except (PermissionError, OSError):
+                continue
 
-    valid_bases: List[Path] = []
-    for b in candidate_bases:
+    return [b for b in candidates if _safe_is_dir(b)]
+
+
+def _newest_transcript_in(base: Path, since: Optional[float]) -> Tuple[Optional[Path], Optional[str], float]:
+    newest_file: Optional[Path] = None
+    newest_id: Optional[str] = None
+    newest_mtime = -1.0
+    try:
+        items = list(base.iterdir())
+    except (PermissionError, OSError):
+        return None, None, newest_mtime
+
+    for item in items:
         try:
-            if b.is_dir():
-                valid_bases.append(b)
+            if not item.is_dir():
+                continue
+            cand = item / ".system_generated" / "logs" / "transcript.jsonl"
+            if not cand.is_file():
+                continue
+            mtime = cand.stat().st_mtime
         except (PermissionError, OSError):
             continue
+        if since is not None and mtime < since:
+            continue
+        if mtime > newest_mtime:
+            newest_mtime = mtime
+            newest_file = cand
+            newest_id = item.name
+    return newest_file, newest_id, newest_mtime
+
+
+def get_transcript_path(
+    conv_id: Optional[str],
+    since: Optional[float] = None
+) -> Tuple[Optional[Path], Optional[str]]:
+    """
+    Searches for transcript.jsonl for a given conversation ID or, when conv_id is None,
+    the newest session. `since` (epoch seconds) restricts the newest-session fallback to
+    transcripts written during the current turn, so an unrelated older session is never
+    picked up.
+    Returns (transcript_path, resolved_conv_id).
+    """
+    bases = list_brain_bases()
 
     if conv_id:
-        for base in valid_bases:
+        for base in bases:
             try:
                 cand = base / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
                 if cand.is_file():
@@ -92,63 +158,58 @@ def get_transcript_path(conv_id: Optional[str]) -> Tuple[Optional[Path], Optiona
                 continue
         return None, conv_id
 
-    # Fallback to newest conversation folder: prioritize current workspace first
+    # Prefer the current workspace brain, then every other base
     ws_brain = Path(WORKSPACE_DIR) / ".gemini" / "brain"
+    if _safe_is_dir(ws_brain):
+        found, found_id, _ = _newest_transcript_in(ws_brain, since)
+        if found and found_id:
+            return found, found_id
+
+    best_file: Optional[Path] = None
+    best_id: Optional[str] = None
+    best_mtime = -1.0
+    for base in bases:
+        found, found_id, mtime = _newest_transcript_in(base, since)
+        if found and mtime > best_mtime:
+            best_file, best_id, best_mtime = found, found_id, mtime
+
+    return best_file, best_id
+
+
+def _read_full_planner_content(transcript_path: Path, entry: dict) -> Optional[str]:
+    full_transcript = transcript_path.parent / "transcript_full.jsonl"
+    if not full_transcript.is_file():
+        return None
+    step_idx = entry.get("step_index")
     try:
-        if ws_brain.is_dir():
-            ws_newest_file = None
-            ws_newest_mtime = -1.0
-            ws_conv_id = None
-            for item in ws_brain.iterdir():
-                try:
-                    if item.is_dir():
-                        cand = item / ".system_generated" / "logs" / "transcript.jsonl"
-                        if cand.is_file():
-                            mtime = cand.stat().st_mtime
-                            if mtime > ws_newest_mtime:
-                                ws_newest_mtime = mtime
-                                ws_newest_file = cand
-                                ws_conv_id = item.name
-                except (PermissionError, OSError):
+        with open(full_transcript, "r", encoding="utf-8", errors="replace") as f_full:
+            for full_line in f_full:
+                if not full_line.strip():
                     continue
-            if ws_newest_file and ws_conv_id:
-                return ws_newest_file, ws_conv_id
-    except (PermissionError, OSError):
-        pass
-    except Exception as e:
-        logger.debug(f"Error checking workspace brain dir {ws_brain}: {e}")
-
-    # Fallback to newest conversation folder across all candidate bases
-    newest_file: Optional[Path] = None
-    newest_mtime = -1.0
-    found_conv_id: Optional[str] = None
-
-    for base in valid_bases:
-        try:
-            for item in base.iterdir():
-                if item.is_dir():
-                    cand = item / ".system_generated" / "logs" / "transcript.jsonl"
-                    if cand.is_file():
-                        mtime = cand.stat().st_mtime
-                        if mtime > newest_mtime:
-                            newest_mtime = mtime
-                            newest_file = cand
-                            found_conv_id = item.name
-        except Exception as e:
-            logger.debug(f"Error checking brain dir {base}: {e}")
-
-    if newest_file and found_conv_id:
-        return newest_file, found_conv_id
-
-    return None, None
+                try:
+                    full_entry = json.loads(full_line)
+                except Exception:
+                    continue
+                if (step_idx is not None and full_entry.get("step_index") == step_idx) or (
+                    step_idx is None and full_entry.get("type") == "PLANNER_RESPONSE"
+                ):
+                    full_content = full_entry.get("content", "").strip()
+                    if full_content:
+                        return full_content
+    except Exception as e_full:
+        logger.debug(f"Gagal membaca transcript_full.jsonl: {e_full}")
+    return None
 
 
-def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def recover_last_response_from_transcript(
+    conv_id: Optional[str],
+    since: Optional[float] = None
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Recovers the model's last response from transcript.jsonl if subprocess timed out.
     Enforces anti-stale turn protection (checks USER_INPUT before PLANNER_RESPONSE).
     """
-    transcript_path, resolved_conv_id = get_transcript_path(conv_id)
+    transcript_path, resolved_conv_id = get_transcript_path(conv_id, since=since)
     if not transcript_path or not transcript_path.is_file():
         return None, resolved_conv_id
 
@@ -157,8 +218,6 @@ def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optio
             lines = [line.strip() for line in f if line.strip()]
 
         last_planner_content = None
-        user_input_seen_after_planner = False
-
         for line in reversed(lines):
             try:
                 entry = json.loads(line)
@@ -167,66 +226,34 @@ def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optio
 
             entry_type = entry.get("type", "")
             if entry_type == "USER_INPUT":
-                if last_planner_content is None:
-                    # Model has not replied yet for this turn
-                    user_input_seen_after_planner = True
-                    break
+                # Reached the start of the current turn: never return an older turn's answer
+                break
 
-            if entry_type == "PLANNER_RESPONSE" and last_planner_content is None:
+            if entry_type == "PLANNER_RESPONSE":
                 content = entry.get("content", "").strip()
-                truncated_fields = entry.get("truncated_fields", [])
-                if "content" in truncated_fields:
-                    full_transcript = transcript_path.parent / "transcript_full.jsonl"
-                    if full_transcript.is_file():
-                        try:
-                            step_idx = entry.get("step_index")
-                            with open(full_transcript, "r", encoding="utf-8", errors="replace") as f_full:
-                                for full_line in f_full:
-                                    if not full_line.strip():
-                                        continue
-                                    try:
-                                        full_entry = json.loads(full_line)
-                                        if (step_idx is not None and full_entry.get("step_index") == step_idx) or (
-                                            step_idx is None and full_entry.get("type") == "PLANNER_RESPONSE"
-                                        ):
-                                            full_content = full_entry.get("content", "").strip()
-                                            if full_content:
-                                                content = full_content
-                                                break
-                                    except Exception:
-                                        continue
-                        except Exception as e_full:
-                            logger.debug(f"Gagal membaca transcript_full.jsonl: {e_full}")
-
+                if "content" in entry.get("truncated_fields", []):
+                    content = _read_full_planner_content(transcript_path, entry) or content
                 if content:
                     last_planner_content = content
+                    break
 
-        if user_input_seen_after_planner:
-            # Cegah mengambil PLANNER_RESPONSE lama dari giliran sebelumnya
-            last_planner_content = None
-
-        # Check if an artifact (.md) was generated in conv_dir if last_planner_content is empty
+        # Fall back to a Markdown artifact generated in the conversation directory
         if not last_planner_content:
-            candidate_dirs = [
-                transcript_path.parent.parent.parent,
-                transcript_path.parent.parent,
-            ]
-            for c_dir in candidate_dirs:
-                if c_dir and c_dir.is_dir():
-                    artifacts = [
-                        f for f in c_dir.glob("*.md")
-                        if f.is_file() and not f.name.startswith(".")
-                    ]
-                    if artifacts:
-                        artifacts.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-                        try:
-                            art_text = artifacts[0].read_text(encoding="utf-8", errors="replace").strip()
-                            if art_text:
-                                logger.info(f"Berhasil me-recover artefak '{artifacts[0].name}' dari {c_dir}")
-                                last_planner_content = art_text
-                                break
-                        except Exception as e_art:
-                            logger.debug(f"Gagal membaca artefak {artifacts[0]}: {e_art}")
+            for c_dir in (transcript_path.parent.parent.parent, transcript_path.parent.parent):
+                if not (c_dir and c_dir.is_dir()):
+                    continue
+                artifacts = [f for f in c_dir.glob("*.md") if f.is_file() and not f.name.startswith(".")]
+                if not artifacts:
+                    continue
+                artifacts.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+                try:
+                    art_text = artifacts[0].read_text(encoding="utf-8", errors="replace").strip()
+                    if art_text:
+                        logger.info(f"Berhasil me-recover artefak '{artifacts[0].name}' dari {c_dir}")
+                        last_planner_content = art_text
+                        break
+                except Exception as e_art:
+                    logger.debug(f"Gagal membaca artefak {artifacts[0]}: {e_art}")
 
         if last_planner_content:
             logger.info(
@@ -241,18 +268,23 @@ def recover_last_response_from_transcript(conv_id: Optional[str]) -> Tuple[Optio
         return None, resolved_conv_id
 
 
+# ==============================================================================
+# SUBPROCESS EXECUTION
+# ==============================================================================
 async def run_agy_cli(
     user_id: int,
     prompt: str,
     conv_id: Optional[str] = None,
-    model: Optional[str] = None,
-    cwd: str = WORKSPACE_DIR
+    cwd: Optional[str] = None,
+    model: Optional[str] = None
 ) -> Tuple[str, Optional[str]]:
     """
     Executes agy CLI as an asynchronous subprocess.
     Extracts conversation_id and response body with timeout & transcript recovery.
     Returns (response_text, new_or_existing_conv_id).
     """
+    effective_cwd = cwd or WORKSPACE_DIR
+
     if not os.path.exists(AGY_BIN_PATH) and not shutil.which(AGY_BIN_PATH):
         raise FileNotFoundError(
             f"Binary agy tidak ditemukan di: '{AGY_BIN_PATH}'. "
@@ -267,9 +299,8 @@ async def run_agy_cli(
     if active_model:
         cmd.extend(["--model", active_model])
 
-    full_prompt = build_cli_prompt(prompt)
     cmd.extend([
-        "-p", full_prompt,
+        "-p", build_cli_prompt(prompt),
         "--print-timeout", f"{AGY_TIMEOUT_SECONDS}s",
     ])
     if AGY_SKIP_PERMISSIONS:
@@ -285,16 +316,18 @@ async def run_agy_cli(
     env["PATH"] = os.pathsep.join(extra_paths + [env.get("PATH", "")])
 
     logger.info(
-        f"Executing agy subprocess for user {user_id} "
-        f"(Conv: {conv_id or 'New'}, Model: {active_model}, Timeout: {AGY_TIMEOUT_SECONDS}s)..."
+        f"Menjalankan subprocess agy untuk user {user_id} "
+        f"(Conv: {conv_id or 'Baru'}, Model: {active_model}, Timeout: {AGY_TIMEOUT_SECONDS}s)..."
     )
 
+    started_at = time.time()
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        cwd=cwd,
+        cwd=effective_cwd,
         env=env,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=(os.name != "nt"),
     )
 
     user_processes[user_id] = proc
@@ -309,35 +342,35 @@ async def run_agy_cli(
         )
     except asyncio.TimeoutError:
         timed_out = True
-        logger.warning(f"Subprocess agy user {user_id} timed out. Terminating...")
+        logger.warning(
+            f"Proses agy untuk user {user_id} (PID: {getattr(proc, 'pid', 'unknown')}) "
+            f"melebihi batas waktu ({AGY_TIMEOUT_SECONDS}s). Menghentikan subprocess..."
+        )
         try:
-            res = proc.terminate()
-            if asyncio.iscoroutine(res):
-                await res
+            terminate_process_tree(proc)
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except Exception:
             try:
-                k_res = proc.kill()
-                if asyncio.iscoroutine(k_res):
-                    await k_res
+                terminate_process_tree(proc, force=True)
             except Exception:
                 pass
     finally:
         user_processes.pop(user_id, None)
 
     if timed_out:
-        recovered, found_id = recover_last_response_from_transcript(conv_id)
+        recovered, found_id = recover_last_response_from_transcript(conv_id, since=started_at)
         eff_id = found_id or conv_id
         if recovered:
             return (
                 f"{recovered}\n\n"
-                f"⏱️ <i>(Catatan: Subprocess agy melebihi batas waktu {AGY_TIMEOUT_SECONDS}s, "
-                f"jawaban berhasil dipulihkan dari transkrip sistem.)</i>",
+                f"⏱️ <i>(Catatan: Subprocess agy melebihi batas waktu {AGY_TIMEOUT_SECONDS} detik dan dihentikan, "
+                f"namun jawaban berhasil dipulihkan dari log transkrip sistem.)</i>",
                 eff_id
             )
         return (
             f"⏱️ **Waktu eksekusi habis (Timeout {AGY_TIMEOUT_SECONDS} detik).**\n"
-            f"Subprocess Antigravity telah dihentikan secara aman demi kestabilan sistem.",
+            f"Subprocess Antigravity telah dihentikan secara aman demi kestabilan sistem.\n\n"
+            f"💡 *Jika tugas memerlukan waktu lebih lama, Anda dapat memperbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`.*",
             eff_id
         )
 
@@ -362,9 +395,9 @@ async def run_agy_cli(
 
     if parsed_json and isinstance(parsed_json, dict):
         ret_conv = parsed_json.get("conversation_id") or conv_id
-        resp = parsed_json.get("response", "").strip()
+        resp = (parsed_json.get("response") or "").strip()
         status = parsed_json.get("status", "")
-        err = parsed_json.get("error", "").strip()
+        err = (parsed_json.get("error") or "").strip()
         duration = parsed_json.get("duration_seconds")
         num_turns = parsed_json.get("num_turns")
 
@@ -372,9 +405,8 @@ async def run_agy_cli(
             return f"❌ **Error dari agy:**\n```text\n{err}\n```", ret_conv
 
         if not resp:
-            # Fallback: Recover from transcript or artifacts if response was empty
-            recover_fn = getattr(sys.modules[__name__], "recover_last_response_from_transcript", recover_last_response_from_transcript)
-            recovered, found_id = recover_fn(ret_conv)
+            # Fallback: recover from transcript or artifacts if response was empty
+            recovered, found_id = recover_last_response_from_transcript(ret_conv, since=started_at)
             if recovered and recovered.strip():
                 resp = recovered.strip()
                 if found_id:
@@ -382,33 +414,25 @@ async def run_agy_cli(
 
         if resp:
             return resp, ret_conv
-        elif err:
+        if err:
             return f"⚠️ **Output agy:**\n```text\n{err}\n```", ret_conv
-        else:
-            dur_str = f" ({duration:.1f}s)" if isinstance(duration, (int, float)) else ""
-            turns_str = f" ({num_turns} turns)" if isinstance(num_turns, int) and num_turns > 1 else ""
-            timeout_hint = ""
-            if isinstance(duration, (int, float)) and duration >= (AGY_TIMEOUT_SECONDS - 5):
-                timeout_hint = (
-                    f"\n\n⏱️ *Catatan:* Proses selesai di batas waktu `{AGY_TIMEOUT_SECONDS}s`. "
-                    f"Jika tugas membutuhkan analisis lebih panjang, perbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`."
-                )
-            return (
-                f"✅ **Tugas Selesai!** Antigravity telah menyelesaikan seluruh langkah eksekusi di latar belakang{dur_str}{turns_str}, namun tidak ada pesan balasan teks langsung.{timeout_hint}",
-                ret_conv
+
+        dur_str = f" ({duration:.1f}s)" if isinstance(duration, (int, float)) else ""
+        turns_str = f" ({num_turns} turns)" if isinstance(num_turns, int) and num_turns > 1 else ""
+        timeout_hint = ""
+        if isinstance(duration, (int, float)) and duration >= (AGY_TIMEOUT_SECONDS - 5):
+            timeout_hint = (
+                f"\n\n⏱️ *Catatan:* Proses selesai di batas waktu `{AGY_TIMEOUT_SECONDS}s`. "
+                f"Jika tugas membutuhkan analisis lebih panjang, perbesar nilai `AGY_TIMEOUT_SECONDS` di file `.env`."
             )
+        return (
+            f"✅ **Tugas Selesai!** Antigravity telah menyelesaikan seluruh langkah eksekusi di latar belakang{dur_str}{turns_str}, namun tidak ada pesan balasan teks langsung.{timeout_hint}",
+            ret_conv
+        )
 
     if stdout_text:
-        clean_stdout = stdout_text.strip()
-        if clean_stdout.startswith("{") and clean_stdout.endswith("}"):
-            try:
-                data = json.loads(clean_stdout)
-                if "conversation_id" in data or "status" in data:
-                    return "✅ **Tugas Selesai!** Antigravity telah menyelesaikan tugas sistem tanpa balasan teks.", conv_id
-            except Exception:
-                pass
         return stdout_text, conv_id
-    elif stderr_text:
+    if stderr_text:
         return f"⚠️ Output (stderr):\n```text\n{stderr_text}\n```", conv_id
 
     return "(agy menyelesaikan tugas tanpa balasan output teks)", conv_id

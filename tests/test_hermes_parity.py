@@ -36,17 +36,14 @@ from tele.formatters import (
 from tele.clarify import (
     detect_clarify_options,
     build_clarify_keyboard,
-    build_slash_confirm_keyboard,
     register_clarification,
     pop_clarification,
-    register_slash_confirm,
-    pop_slash_confirm,
 )
 from tele.media import (
     sniff_raster_format,
     compress_image_to_jpeg,
 )
-from tele.topics import parse_topic_args
+from tele.topics import parse_topic_args, TopicWorkspaceError
 from database.state import StateDatabase
 
 
@@ -141,11 +138,24 @@ class TestHermesParityForumTopicsAndRouting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             ws_target = Path(tmp_dir) / "auth_service"
             raw = f"Auth Service --path={ws_target} --model=claude-3-7-sonnet"
-            name, ws, model = parse_topic_args(raw)
+            with patch("tele.topics.TOPIC_WORKSPACE_ROOTS", [str(Path(tmp_dir).resolve())]):
+                name, ws, model = parse_topic_args(raw)
             self.assertEqual(name, "Auth Service")
             self.assertEqual(ws, str(ws_target.resolve()))
             self.assertEqual(model, "claude-3-7-sonnet")
             self.assertTrue(ws_target.is_dir())
+
+    def test_parse_topic_args_rejects_path_outside_roots(self):
+        with tempfile.TemporaryDirectory() as allowed, tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "evil"
+            with patch("tele.topics.TOPIC_WORKSPACE_ROOTS", [str(Path(allowed).resolve())]):
+                with self.assertRaises(TopicWorkspaceError):
+                    parse_topic_args(["Evil", f"--path={target}"])
+                with self.assertRaises(TopicWorkspaceError):
+                    parse_topic_args(["Root", f"--path={Path(allowed).anchor}"])
+                with self.assertRaises(TopicWorkspaceError):
+                    parse_topic_args(["Keys", f"--path={Path(allowed) / '.ssh'}"])
+            self.assertFalse(target.exists())
 
     def test_database_topic_bindings_and_pruning(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -216,17 +226,33 @@ class TestHermesParityClarifyAndSlashConfirm(unittest.TestCase):
         self.assertEqual(stored["options"], options)
         self.assertIsNone(pop_clarification(cid))
 
-    def test_slash_confirm_keyboard_and_lifecycle(self):
-        confirm_id = "test_conf_123"
-        register_slash_confirm(confirm_id, {"command": "/reset", "user_id": 999})
-        kb = build_slash_confirm_keyboard(confirm_id)
-        self.assertEqual(len(kb.inline_keyboard[0]), 2)
-        self.assertEqual(kb.inline_keyboard[0][0].callback_data, f"sc:{confirm_id}:approve")
-        self.assertEqual(kb.inline_keyboard[0][1].callback_data, f"sc:{confirm_id}:deny")
+    def test_detect_clarify_ignores_plain_reports(self):
+        # A bulleted summary followed by more prose is not a question
+        report = (
+            "Ringkasan audit:\n"
+            "- Endpoint login sudah memakai rate limit\n"
+            "- Session cookie sudah HttpOnly\n\n"
+            "Secara keseluruhan aplikasi dalam kondisi baik dan siap dirilis."
+        )
+        self.assertIsNone(detect_clarify_options(report))
 
-        stored = pop_slash_confirm(confirm_id)
-        self.assertEqual(stored["command"], "/reset")
-        self.assertIsNone(pop_slash_confirm(confirm_id))
+        # A trailing list without a choice intro is not a question either
+        steps = "Langkah yang sudah saya kerjakan:\n1. Update dependency\n2. Jalankan test"
+        self.assertIsNone(detect_clarify_options(steps))
+
+    def test_detect_clarify_uses_trailing_block_and_question(self):
+        text = (
+            "Hasil analisis:\n"
+            "1. Query lambat di dashboard\n"
+            "2. Index hilang di tabel orders\n\n"
+            "Mau saya kerjakan yang mana dulu?\n"
+            "1. Tambah index\n"
+            "2. Refactor query"
+        )
+        res = detect_clarify_options(text)
+        self.assertIsNotNone(res)
+        _, options = res
+        self.assertEqual(options, ["Tambah index", "Refactor query"])
 
 
 class TestHermesParityRichMedia(unittest.TestCase):
